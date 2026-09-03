@@ -19,11 +19,17 @@ from domain.pipeline import (
     PipelineState,
 )
 from domain.posts import CatalogPost, SOURCE_VK_CATALOG
-from ui.formatters import format_post_date, format_reason, format_score_percent, human_state
+from ui.formatters import (
+    format_post_date,
+    format_reason,
+    format_score_percent,
+    format_views_label,
+    human_state,
+)
 from ui.main_window import MainWindow
 from ui.profile_dialog import ProfileSelectDialog, format_profile_label
 from ui.widgets.post_card import PostCard
-from ui.widgets.results_view import ResultFilter, ResultsView
+from ui.widgets.results_view import ResultFilter, ResultSort, ResultsView
 from app.auth.models import VKProfile
 from ui.theme import apply_theme
 
@@ -33,20 +39,27 @@ if _APP is None:
 apply_theme(_APP)
 
 
-def _post(local_id: int, text: str = "text") -> CatalogPost:
+def _post(local_id: int, text: str = "text", *, views: int = 0) -> CatalogPost:
     return CatalogPost(
         source=SOURCE_VK_CATALOG,
         owner_id=-1,
         post_id=local_id,
         text=text,
         date=datetime.fromtimestamp(1_700_000_000, tz=UTC),
+        views=views,
         id=local_id,
     )
 
 
-def _analyzed(local_id: int, *, score: float, text: str = "text") -> AnalyzedPost:
+def _analyzed(
+    local_id: int,
+    *,
+    score: float,
+    text: str = "text",
+    views: int = 0,
+) -> AnalyzedPost:
     return AnalyzedPost(
-        post=_post(local_id, text=text),
+        post=_post(local_id, text=text, views=views),
         analysis=ClickbaitAnalysis(
             post_id=local_id,
             score=score,
@@ -195,24 +208,52 @@ class ResultsViewTests(unittest.TestCase):
         view.set_filter(ResultFilter.ALL)
         self.assertEqual(len(view.visible_posts()), 3)
 
+    def test_sort_and_min_views(self) -> None:
+        view = ResultsView()
+        view.set_results(
+            [
+                _analyzed(1, score=0.9, views=10),
+                _analyzed(2, score=0.1, views=500),
+                _analyzed(3, score=0.8, views=100),
+            ]
+        )
+        view.set_sort(ResultSort.VIEWS_DESC)
+        self.assertEqual(
+            [p.post.post_id for p in view.visible_posts()],
+            [2, 3, 1],
+        )
+        view.set_min_views(100)
+        self.assertEqual(
+            [p.post.post_id for p in view.visible_posts()],
+            [2, 3],
+        )
+        view.set_sort(ResultSort.VIEWS_ASC)
+        self.assertEqual(
+            [p.post.post_id for p in view.visible_posts()],
+            [3, 2],
+        )
+
 
 class FormattersTests(unittest.TestCase):
     def test_score_and_reason_and_date(self) -> None:
         self.assertEqual(format_score_percent(0.82), "82%")
-        self.assertEqual(format_reason("continuation_bait"), "Continuation bait")
+        self.assertEqual(format_reason("continuation_bait"), "Продолжение по ссылке")
         when = format_post_date(datetime(2026, 9, 4, 1, 1, tzinfo=UTC))
         self.assertIn("сент.", when)
         self.assertIn("2026", when)
         self.assertEqual(human_state(PipelineState.ANALYZING), "Анализ постов")
+        self.assertIn("просмотр", format_views_label(1))
+        self.assertIn("12.5K", format_views_label(12_500))
 
 
 class PostCardTests(unittest.TestCase):
     def test_renders_percent_and_copies_text(self) -> None:
         card = PostCard()
-        item = _analyzed(1, score=0.82, text="полный текст поста")
+        item = _analyzed(1, score=0.82, text="полный текст поста", views=1500)
         card.set_post(item)
         self.assertEqual(card._score.text(), "82%")
         self.assertEqual(card._prediction.text(), "CLICKBAIT")
+        self.assertIn("просмотр", card._meta_label.text().lower())
         card._on_copy()
         self.assertEqual(QApplication.clipboard().text(), "полный текст поста")
         self.assertEqual(card._copy_button.toolTip(), "Copied")

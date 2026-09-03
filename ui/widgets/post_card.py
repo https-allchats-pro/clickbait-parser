@@ -20,6 +20,7 @@ from ui.formatters import (
     format_post_date,
     format_reason,
     format_score_percent,
+    format_views_label,
 )
 from ui.theme import SP_8, SP_12, SP_16
 from ui.widgets.flow_layout import FlowLayout
@@ -74,7 +75,7 @@ class PostCard(QFrame):
         divider.setFrameShape(QFrame.Shape.HLine)
         divider.setStyleSheet("color: #3a3a3c; background: #3a3a3c; max-height: 1px;")
 
-        self._reasons_title = QLabel("Reasons")
+        self._reasons_title = QLabel("Причины")
         self._reasons_title.setObjectName("reasonsTitle")
 
         self._chips_host = QWidget()
@@ -128,9 +129,10 @@ class PostCard(QFrame):
 
         when = format_post_date(post.date)
         source = "VK Catalog" if post.source.startswith("vk") else post.source
-        self._meta_label.setText(f"{source}  ·  {when}")
+        views = format_views_label(post.views)
+        self._meta_label.setText(f"{source}  ·  {when}  ·  {views}")
         self._meta_label.setToolTip(
-            f"Owner ID: {post.owner_id}\nPost ID: {post.post_id}"
+            f"Owner ID: {post.owner_id}\nPost ID: {post.post_id}\nViews: {post.views}"
         )
 
         self._link_urls = [link.url for link in post.links if link.url]

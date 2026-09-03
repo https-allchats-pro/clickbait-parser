@@ -184,7 +184,7 @@ class CatalogServiceTests(unittest.TestCase):
 
         service = CatalogService(client=client, posts=posts_repo)
         result = service.collect(count=100)
-        client.get_search_top.assert_called_once_with(count=100, start_from=None, query=None)
+        client.get_search_top.assert_called_once_with(count=50, start_from=None, query=None)
         posts_repo.upsert_many.assert_called_once_with(page_posts)
         self.assertEqual(result.fetched, 1)
         self.assertEqual(result.upsert.inserted, 1)
@@ -209,7 +209,7 @@ class CatalogServiceTests(unittest.TestCase):
                             text="x",
                             date=datetime.fromtimestamp(1, tz=UTC),
                         )
-                        for i in range(count)
+                        for i in range(2)  # partial first page → need page 2
                     ],
                     next_from="n1",
                 )
@@ -239,10 +239,93 @@ class CatalogServiceTests(unittest.TestCase):
         client.get_search_top.side_effect = _page
         posts_repo.get.side_effect = _get
         service = CatalogService(client=client, posts=posts_repo)
+        # page_size is capped to VK's ~20; request 2 to exercise multi-page.
         result = service.collect(count=3, page_size=2, pages=5)
         self.assertEqual(result.fetched, 3)
         self.assertEqual(len(result.posts), 3)
         self.assertEqual(client.get_search_top.call_count, 2)
+        # VK page size stays fixed across pages (do not shrink count near the end).
+        self.assertEqual(client.get_search_top.call_args_list[0].kwargs["count"], 50)
+        self.assertEqual(client.get_search_top.call_args_list[1].kwargs["count"], 50)
+
+    def test_collect_continues_when_first_page_is_partial(self) -> None:
+        client = MagicMock()
+        posts_repo = MagicMock()
+        posts_repo.upsert_many.return_value = type(
+            "R", (), {"inserted": 1, "updated": 0, "unchanged": 0}
+        )()
+
+        pages = [
+            CatalogPage(
+                posts=[
+                    CatalogPost(
+                        source=SOURCE_VK_CATALOG,
+                        owner_id=-1,
+                        post_id=i,
+                        text="x",
+                        date=datetime.fromtimestamp(1, tz=UTC),
+                    )
+                    for i in range(20)
+                ],
+                next_from="n1",
+            ),
+            CatalogPage(
+                posts=[
+                    CatalogPost(
+                        source=SOURCE_VK_CATALOG,
+                        owner_id=-1,
+                        post_id=100 + i,
+                        text="y",
+                        date=datetime.fromtimestamp(2, tz=UTC),
+                    )
+                    for i in range(20)
+                ],
+                next_from=None,
+            ),
+        ]
+        client.get_search_top.side_effect = pages
+
+        def _get(source: str, owner_id: int, post_id: int) -> CatalogPost:
+            return CatalogPost(
+                source=source,
+                owner_id=owner_id,
+                post_id=post_id,
+                text="x",
+                date=datetime.fromtimestamp(1, tz=UTC),
+                id=post_id,
+            )
+
+        posts_repo.get.side_effect = _get
+        service = CatalogService(client=client, posts=posts_repo)
+        result = service.collect(count=30, page_size=100, pages=1)
+        self.assertEqual(result.fetched, 30)
+        self.assertEqual(client.get_search_top.call_count, 2)
+        self.assertEqual(client.get_search_top.call_args_list[0].kwargs["count"], 50)
+        self.assertEqual(client.get_search_top.call_args_list[1].kwargs["count"], 50)
+        client = MagicMock()
+        posts_repo = MagicMock()
+        posts_repo.upsert_many.return_value = type(
+            "R", (), {"inserted": 0, "updated": 0, "unchanged": 1}
+        )()
+        dup = CatalogPost(
+            source=SOURCE_VK_CATALOG,
+            owner_id=-1,
+            post_id=1,
+            text="same",
+            date=datetime.fromtimestamp(1, tz=UTC),
+            id=1,
+        )
+        client.get_search_top.side_effect = [
+            CatalogPage(posts=[dup], next_from="n1"),
+            CatalogPage(posts=[dup], next_from="n2"),
+            CatalogPage(posts=[dup], next_from="n3"),
+        ]
+        posts_repo.get.return_value = dup
+        service = CatalogService(client=client, posts=posts_repo)
+        result = service.collect(count=50, pages=20)
+        self.assertEqual(result.fetched, 1)
+        # first page yields 1, next two are stagnant → stop
+        self.assertEqual(client.get_search_top.call_count, 3)
 
 
 if __name__ == "__main__":

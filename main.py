@@ -64,7 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
         "-q",
         "--query",
         default="",
-        help="Search query for catalog.getSearchStatuses",
+        help="Search query for newsfeed.search",
     )
     collect.add_argument("--profile-id", type=int, default=None)
     collect.add_argument("--start-from", default=None)
@@ -508,7 +508,7 @@ def main(argv: list[str] | None = None) -> int:
 
             print("VK Global Catalog")
             print(f"Profile:    {profile_id}")
-            print(f"Method:     catalog.getSearchStatuses")
+            print(f"Method:     newsfeed.search")
             if args.query:
                 print(f"Query:      {args.query}")
             print(f"Fetched:    {result.fetched}")

@@ -20,16 +20,16 @@ _MONTHS_RU = (
 )
 
 REASON_LABELS: dict[str, str] = {
-    "continuation_bait": "Continuation bait",
-    "curiosity_bait": "Curiosity bait",
-    "cta": "Call to action",
-    "external_link": "External link",
-    "cta_near_link": "CTA near link",
-    "short_text_with_link": "Short text + link",
-    "ellipsis": "Ellipsis",
-    "excessive_punctuation": "Excessive punctuation",
-    "caps": "Excessive caps",
-    "emoji": "Emoji",
+    "continuation_bait": "Продолжение по ссылке",
+    "curiosity_bait": "Любопытство / интрига",
+    "cta": "Призыв к действию",
+    "external_link": "Внешняя ссылка",
+    "cta_near_link": "Призыв рядом со ссылкой",
+    "short_text_with_link": "Короткий текст + ссылка",
+    "ellipsis": "Многоточие",
+    "excessive_punctuation": "Лишняя пунктуация",
+    "caps": "КРИЧАЩИЙ КАПС",
+    "emoji": "Эмодзи",
 }
 
 STATE_LABELS: dict[PipelineState, str] = {
@@ -65,6 +65,26 @@ def format_links_label(count: int) -> str:
     if 2 <= count <= 4:
         return f"{count} ссылки"
     return f"{count} ссылок"
+
+
+def format_views_label(count: int) -> str:
+    value = max(0, int(count))
+    if value == 0:
+        return "0 просмотров"
+    # Compact thousands: 12.5K
+    if value >= 1_000_000:
+        text = f"{value / 1_000_000:.1f}".rstrip("0").rstrip(".") + "M"
+    elif value >= 10_000:
+        text = f"{value / 1_000:.1f}".rstrip("0").rstrip(".") + "K"
+    else:
+        text = f"{value:,}".replace(",", " ")
+    if value % 10 == 1 and value % 100 != 11:
+        unit = "просмотр"
+    elif 2 <= value % 10 <= 4 and not (12 <= value % 100 <= 14):
+        unit = "просмотра"
+    else:
+        unit = "просмотров"
+    return f"{text} {unit}"
 
 
 def human_state(state: PipelineState) -> str:

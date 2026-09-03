@@ -24,6 +24,7 @@ class CatalogCollector(Protocol):
         pages: int = 1,
         page_size: int = 100,
         query: str | None = None,
+        on_progress=None,
     ) -> CollectResult: ...
 
 
@@ -33,8 +34,8 @@ class AnalysisPersister(Protocol):
 
 ProgressCallback = Callable[[PipelineProgress], None]
 
-# catalog.getSearchStatuses often returns ~20 items even when count is larger.
-_VK_CATALOG_PAGE_HINT = 20
+# newsfeed.search page size used by CatalogService.
+_VK_CATALOG_PAGE_HINT = 50
 
 
 class ClickbaitPipeline:
@@ -79,17 +80,29 @@ class ClickbaitPipeline:
 
         try:
             self._set_state(PipelineState.COLLECTING, current=0, total=request.limit)
-            # Budget pages for both our page_size and typical VK page size (~20).
+            # Extra page budget: VK pages often overlap; collect() also stops on stagnant pages.
             pages = max(
                 1,
+                request.limit,
                 (request.limit + self._page_size - 1) // self._page_size,
                 (request.limit + _VK_CATALOG_PAGE_HINT - 1) // _VK_CATALOG_PAGE_HINT,
             )
+
+            def _collect_progress(current: int, total: int) -> None:
+                self._emit(
+                    PipelineProgress(
+                        state=PipelineState.COLLECTING,
+                        current=current,
+                        total=total,
+                    )
+                )
+
             collect_result = self._catalog.collect(
                 count=request.limit,
                 pages=pages,
                 page_size=self._page_size,
                 query=query,
+                on_progress=_collect_progress,
             )
             posts = list(collect_result.posts)[: request.limit]
             self._emit(

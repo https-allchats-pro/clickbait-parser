@@ -148,8 +148,16 @@ def iter_raw_wall_posts(payload: Any) -> list[dict[str, Any]]:
         seen.add(key)
         found.append(post)
 
-    # Preferred path for catalog.getSearchStatuses.
+    # Preferred path for newsfeed.search (items[]) and catalog statuses.
     if isinstance(payload, dict):
+        items = payload.get("items")
+        if isinstance(items, list) and items:
+            for item in items:
+                if isinstance(item, dict):
+                    _take(item)
+            if found:
+                return found
+
         newsfeed_items = payload.get("newsfeed_items")
         if isinstance(newsfeed_items, list) and newsfeed_items:
             for wrap in newsfeed_items:

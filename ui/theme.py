@@ -109,7 +109,7 @@ QFrame#errorPanel {{
     border-radius: 12px;
 }}
 
-QLineEdit, QSpinBox, QListWidget {{
+QLineEdit, QSpinBox, QComboBox, QListWidget {{
     background-color: {COLORS["bg_input"]};
     border: 1px solid {COLORS["border"]};
     border-radius: 8px;
@@ -117,8 +117,19 @@ QLineEdit, QSpinBox, QListWidget {{
     selection-background-color: {COLORS["accent"]};
 }}
 
-QLineEdit:focus, QSpinBox:focus {{
+QLineEdit:focus, QSpinBox:focus, QComboBox:focus {{
     border: 1px solid {COLORS["accent"]};
+}}
+
+QComboBox::drop-down {{
+    border: none;
+    width: 24px;
+}}
+
+QComboBox QAbstractItemView {{
+    background-color: {COLORS["bg_elevated"]};
+    border: 1px solid {COLORS["border"]};
+    selection-background-color: {COLORS["accent"]};
 }}
 
 QSpinBox::up-button, QSpinBox::down-button {{

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from allchats_sdk.providers.vk.catalog import get_search_statuses
+from allchats_sdk.providers.vk.catalog import get_newsfeed_search
 from allchats_sdk.providers.vk.native_api import VkNativeApiError
 
 from domain.posts import CatalogPage
@@ -32,10 +32,11 @@ class CatalogClient(Protocol):
 
 
 class VKCatalogClient:
-    """Infrastructure adapter: allchats-sdk catalog → domain CatalogPage.
+    """Infrastructure adapter: VK wall-post search → domain CatalogPage.
 
-    Uses ``catalog.getSearchStatuses`` (wall posts). ``catalog.getSearchTop`` only
-    returns people/communities UI blocks and is not used for post collection.
+    Uses ``newsfeed.search`` (real pagination via ``next_from``).
+    ``catalog.getSearchStatuses`` only returns ~15–20 unique UI posts and does
+    not advance the cursor usefully, so it is not used for collection anymore.
     """
 
     def __init__(
@@ -58,11 +59,11 @@ class VKCatalogClient:
         query: str | None = None,
     ) -> CatalogPage:
         try:
-            page = get_search_statuses(
+            page = get_newsfeed_search(
                 access_token=self._access_token,
                 count=count,
                 start_from=start_from,
-                q=query if query is not None else "",
+                q=query,
             )
         except VkNativeApiError as exc:
             if exc.error_code in {5, 1117}:

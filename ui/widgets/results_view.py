@@ -5,16 +5,18 @@ from enum import Enum
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QButtonGroup,
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QScrollArea,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
 from domain.pipeline import AnalyzedPost
-from ui.theme import SP_8, SP_12
+from ui.theme import SP_4, SP_8, SP_12
 from ui.widgets.post_card import PostCard
 
 
@@ -24,13 +26,21 @@ class ResultFilter(str, Enum):
     NORMAL = "normal"
 
 
+class ResultSort(str, Enum):
+    DEFAULT = "default"
+    VIEWS_DESC = "views_desc"
+    VIEWS_ASC = "views_asc"
+
+
 class ResultsView(QWidget):
-    """Scrollable list of AnalyzedPost cards with client-side filter."""
+    """Scrollable list of AnalyzedPost cards with client-side filter/sort."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._posts: list[AnalyzedPost] = []
         self._filter = ResultFilter.ALL
+        self._sort = ResultSort.DEFAULT
+        self._min_views = 0
         self._received_results = False
 
         self._empty_title = QLabel("Запустите анализ")
@@ -77,12 +87,47 @@ class ResultsView(QWidget):
             filter_row.addWidget(button)
         self._btn_all.setChecked(True)
         self._filter_group.idClicked.connect(self._on_filter_clicked)
+
         filter_row.addStretch(1)
+
+        sort_label = QLabel("Сортировка")
+        sort_label.setObjectName("sectionLabel")
+        self._sort_combo = QComboBox()
+        self._sort_combo.addItem("По умолчанию", ResultSort.DEFAULT.value)
+        self._sort_combo.addItem("Просмотры ↓", ResultSort.VIEWS_DESC.value)
+        self._sort_combo.addItem("Просмотры ↑", ResultSort.VIEWS_ASC.value)
+        self._sort_combo.currentIndexChanged.connect(self._on_sort_changed)
+
+        min_label = QLabel("Мин. просмотры")
+        min_label.setObjectName("sectionLabel")
+        self._min_views_input = QSpinBox()
+        self._min_views_input.setMinimum(0)
+        self._min_views_input.setMaximum(100_000_000)
+        self._min_views_input.setValue(0)
+        self._min_views_input.setSingleStep(100)
+        self._min_views_input.setFixedWidth(110)
+        self._min_views_input.setToolTip("Показывать только посты с не меньшим числом просмотров")
+        self._min_views_input.valueChanged.connect(self._on_min_views_changed)
+
+        controls = QHBoxLayout()
+        controls.setSpacing(SP_8)
+        sort_col = QVBoxLayout()
+        sort_col.setSpacing(SP_4)
+        sort_col.addWidget(sort_label)
+        sort_col.addWidget(self._sort_combo)
+        min_col = QVBoxLayout()
+        min_col.setSpacing(SP_4)
+        min_col.addWidget(min_label)
+        min_col.addWidget(self._min_views_input)
+        controls.addLayout(sort_col)
+        controls.addLayout(min_col)
+        controls.addStretch(1)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(SP_12)
         root.addLayout(filter_row)
+        root.addLayout(controls)
         root.addWidget(self._empty_host, stretch=1)
         root.addWidget(self._scroll, stretch=1)
         self._scroll.hide()
@@ -107,15 +152,42 @@ class ResultsView(QWidget):
         mapping[value].setChecked(True)
         self._render()
 
+    def set_sort(self, value: ResultSort) -> None:
+        self._sort = value
+        index = self._sort_combo.findData(value.value)
+        if index >= 0:
+            self._sort_combo.setCurrentIndex(index)
+        self._render()
+
+    def set_min_views(self, value: int) -> None:
+        self._min_views = max(0, int(value))
+        self._min_views_input.setValue(self._min_views)
+        self._render()
+
     def current_filter(self) -> ResultFilter:
         return self._filter
 
+    def current_sort(self) -> ResultSort:
+        return self._sort
+
+    def current_min_views(self) -> int:
+        return self._min_views
+
     def visible_posts(self) -> list[AnalyzedPost]:
+        posts = list(self._posts)
         if self._filter == ResultFilter.CLICKBAIT:
-            return [p for p in self._posts if p.analysis.is_clickbait]
-        if self._filter == ResultFilter.NORMAL:
-            return [p for p in self._posts if not p.analysis.is_clickbait]
-        return list(self._posts)
+            posts = [p for p in posts if p.analysis.is_clickbait]
+        elif self._filter == ResultFilter.NORMAL:
+            posts = [p for p in posts if not p.analysis.is_clickbait]
+
+        if self._min_views > 0:
+            posts = [p for p in posts if int(p.post.views or 0) >= self._min_views]
+
+        if self._sort == ResultSort.VIEWS_DESC:
+            posts.sort(key=lambda p: int(p.post.views or 0), reverse=True)
+        elif self._sort == ResultSort.VIEWS_ASC:
+            posts.sort(key=lambda p: int(p.post.views or 0))
+        return posts
 
     def _on_filter_clicked(self, button_id: int) -> None:
         mapping = {
@@ -124,6 +196,18 @@ class ResultsView(QWidget):
             2: ResultFilter.NORMAL,
         }
         self._filter = mapping.get(button_id, ResultFilter.ALL)
+        self._render()
+
+    def _on_sort_changed(self, _index: int) -> None:
+        raw = self._sort_combo.currentData()
+        try:
+            self._sort = ResultSort(str(raw))
+        except ValueError:
+            self._sort = ResultSort.DEFAULT
+        self._render()
+
+    def _on_min_views_changed(self, value: int) -> None:
+        self._min_views = max(0, int(value))
         self._render()
 
     def _clear_cards(self) -> None:
@@ -161,8 +245,8 @@ class ResultsView(QWidget):
 
         if not visible:
             self._show_empty(
-                "Нет постов для выбранного фильтра",
-                "Переключите фильтр All / Clickbait / Normal.",
+                "Нет постов для выбранных фильтров",
+                "Измените All / Clickbait / Normal, сортировку или мин. просмотры.",
             )
             self._cards_layout.addStretch(1)
             return
