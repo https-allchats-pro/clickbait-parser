@@ -65,9 +65,16 @@ class PipelineRequestTests(unittest.TestCase):
 
 
 class FakeCatalog:
-    def __init__(self, posts: list[CatalogPost] | None = None, *, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        posts: list[CatalogPost] | None = None,
+        *,
+        error: Exception | None = None,
+        next_from: str | None = "cursor-1",
+    ) -> None:
         self.posts = posts or []
         self.error = error
+        self.next_from = next_from
         self.calls: list[dict[str, Any]] = []
 
     def collect(
@@ -78,6 +85,7 @@ class FakeCatalog:
         pages: int = 1,
         page_size: int = 100,
         query: str | None = None,
+        exclude_texts: frozenset[str] | set[str] | None = None,
         on_progress=None,
     ) -> CollectResult:
         self.calls.append(
@@ -87,6 +95,7 @@ class FakeCatalog:
                 "pages": pages,
                 "page_size": page_size,
                 "query": query,
+                "exclude_texts": frozenset(exclude_texts or ()),
             }
         )
         if self.error is not None:
@@ -98,6 +107,7 @@ class FakeCatalog:
             fetched=len(selected),
             upsert=UpsertResult(inserted=len(selected)),
             posts=list(selected),
+            next_from=self.next_from,
         )
 
 
@@ -256,6 +266,20 @@ class ClickbaitPipelineTests(unittest.TestCase):
         result = pipeline.run(PipelineRequest(limit=1))
         analyzer.analyze.assert_called_once()
         self.assertTrue(result.posts[0].analysis.is_clickbait)
+
+    def test_start_from_and_exclude_texts_passed(self) -> None:
+        catalog = FakeCatalog([_post(1)], next_from="next-2")
+        pipeline = ClickbaitPipeline(catalog_service=catalog, analyzer=FakeAnalyzer())
+        result = pipeline.run(
+            PipelineRequest(
+                limit=1,
+                start_from="cursor-a",
+                exclude_texts=frozenset({"hello"}),
+            )
+        )
+        self.assertEqual(catalog.calls[0]["start_from"], "cursor-a")
+        self.assertEqual(catalog.calls[0]["exclude_texts"], frozenset({"hello"}))
+        self.assertEqual(result.next_from, "next-2")
 
 
 if __name__ == "__main__":

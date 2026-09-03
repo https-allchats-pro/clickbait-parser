@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
 )
 
 from domain.pipeline import PipelineProgress, PipelineRequest, PipelineResult, PipelineState
+from domain.posts import post_text_key
 from ui.formatters import human_state
 from ui.theme import SP_4, SP_8, SP_12, SP_16, SP_24
 from ui.widgets.results_view import ResultsView
@@ -34,6 +35,7 @@ class MainWindow(QMainWindow):
 
         self._query_input = QLineEdit()
         self._query_input.setPlaceholderText("искать продолжение, новости…")
+        self._query_input.textChanged.connect(self._on_query_changed)
 
         self._limit_input = QSpinBox()
         self._limit_input.setMinimum(1)
@@ -41,10 +43,18 @@ class MainWindow(QMainWindow):
         self._limit_input.setValue(100)
         self._limit_input.setFixedWidth(100)
 
+        self._next_page_button = QPushButton("Следующая страница")
+        self._next_page_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._next_page_button.setEnabled(False)
+        self._next_page_button.clicked.connect(self._on_next_page_clicked)
+
         self._run_button = QPushButton("Анализ")
         self._run_button.setObjectName("primaryButton")
         self._run_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self._run_button.clicked.connect(self._on_run_clicked)
+
+        self._page_range_label = QLabel("")
+        self._page_range_label.setObjectName("statusFooter")
 
         search_label = QLabel("Search")
         search_label.setObjectName("sectionLabel")
@@ -58,6 +68,7 @@ class MainWindow(QMainWindow):
         limit_col.addWidget(limit_label)
         limit_col.addWidget(self._limit_input)
         limit_row.addLayout(limit_col)
+        limit_row.addWidget(self._next_page_button, alignment=Qt.AlignmentFlag.AlignBottom)
         limit_row.addStretch(1)
         limit_row.addWidget(self._run_button, alignment=Qt.AlignmentFlag.AlignBottom)
 
@@ -102,7 +113,11 @@ class MainWindow(QMainWindow):
         progress_layout.setSpacing(SP_8)
         progress_layout.addLayout(progress_header)
         progress_layout.addWidget(self._progress_bar)
-        progress_layout.addWidget(self._status_footer)
+        footer_row = QHBoxLayout()
+        footer_row.addWidget(self._status_footer)
+        footer_row.addStretch(1)
+        footer_row.addWidget(self._page_range_label)
+        progress_layout.addLayout(footer_row)
 
         self._stat_posts = self._make_stat_card("0", "Posts")
         self._stat_clickbait = self._make_stat_card("0", "Clickbait")
@@ -150,6 +165,10 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(container)
 
         self._controller: object | None = None
+        self._next_from: str | None = None
+        self._seen_texts: set[str] = set()
+        self._page_offset: int = 0
+        self._pending_page_offset: int = 0
 
     def _make_stat_card(self, value: str, caption: str) -> QFrame:
         card = QFrame()
@@ -174,15 +193,30 @@ class MainWindow(QMainWindow):
     def results_view(self) -> ResultsView:
         return self._results
 
-    def build_request(self) -> PipelineRequest:
+    @property
+    def next_page_enabled(self) -> bool:
+        return self._next_page_button.isEnabled()
+
+    def build_request(
+        self,
+        *,
+        start_from: str | None = None,
+        exclude_texts: frozenset[str] | None = None,
+    ) -> PipelineRequest:
         query = self._query_input.text().strip() or None
-        return PipelineRequest(limit=int(self._limit_input.value()), query=query)
+        return PipelineRequest(
+            limit=int(self._limit_input.value()),
+            query=query,
+            start_from=start_from,
+            exclude_texts=exclude_texts or frozenset(),
+        )
 
     def set_running(self, running: bool) -> None:
         self._run_button.setEnabled(not running)
         self._query_input.setEnabled(not running)
         self._limit_input.setEnabled(not running)
         self._retry_button.setEnabled(not running)
+        self._next_page_button.setEnabled((not running) and bool(self._next_from))
         if running:
             self._run_button.setText("Анализируется...")
             self.clear_error()
@@ -220,11 +254,28 @@ class MainWindow(QMainWindow):
             self._progress_bar.setMaximum(1)
             self._progress_bar.setValue(0)
 
-        posts = result.posts
+        # ResultsView dedupes by text; stats follow what is shown.
+        self._results.set_results(result.posts)
+        posts = self._results.posts
         clickbait = sum(1 for item in posts if item.analysis.is_clickbait)
         normal = len(posts) - clickbait
         self._set_stats(len(posts), clickbait, normal)
-        self._results.set_results(posts)
+
+        self._page_offset = self._pending_page_offset
+        if posts:
+            start = self._page_offset + 1
+            end = self._page_offset + len(posts)
+            self._page_range_label.setText(f"Посты {start}–{end}")
+        else:
+            self._page_range_label.setText("")
+
+        for item in posts:
+            key = post_text_key(item.post.text)
+            if key:
+                self._seen_texts.add(key)
+
+        self._next_from = result.next_from
+        self._next_page_button.setEnabled(bool(self._next_from))
         self.clear_error()
 
     def show_error(self, message: str) -> None:
@@ -242,10 +293,42 @@ class MainWindow(QMainWindow):
         self._stat_clickbait._value_label.setText(str(clickbait))  # type: ignore[attr-defined]
         self._stat_normal._value_label.setText(str(normal))  # type: ignore[attr-defined]
 
+    def _reset_pagination(self) -> None:
+        self._next_from = None
+        self._seen_texts = set()
+        self._page_offset = 0
+        self._pending_page_offset = 0
+        self._page_range_label.setText("")
+        self._next_page_button.setEnabled(False)
+
+    def _on_query_changed(self, _text: str = "") -> None:
+        # Cursor from a previous query must not be reused.
+        if self._next_from is not None or self._seen_texts:
+            self._reset_pagination()
+
+    def _emit_request(self, request: PipelineRequest) -> None:
+        self.run_requested.emit(request)
+
     def _on_run_clicked(self) -> None:
         try:
+            self._reset_pagination()
+            self._pending_page_offset = 0
             request = self.build_request()
         except ValueError as exc:
             QMessageBox.warning(self, "Некорректный ввод", str(exc))
             return
-        self.run_requested.emit(request)
+        self._emit_request(request)
+
+    def _on_next_page_clicked(self) -> None:
+        if not self._next_from:
+            return
+        try:
+            self._pending_page_offset = self._page_offset + int(self._limit_input.value())
+            request = self.build_request(
+                start_from=self._next_from,
+                exclude_texts=frozenset(self._seen_texts),
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Некорректный ввод", str(exc))
+            return
+        self._emit_request(request)

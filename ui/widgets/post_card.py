@@ -42,10 +42,23 @@ class PostCard(QFrame):
         self._score.setObjectName("scoreBadge")
         self._score.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
+        self._copy_button = QToolButton()
+        self._copy_button.setObjectName("iconButton")
+        self._copy_button.setToolTip("Copy post text")
+        self._copy_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        icon = QIcon.fromTheme("edit-copy")
+        if icon.isNull():
+            icon = self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton)
+        self._copy_button.setIcon(icon)
+        self._copy_button.setText("Copy")
+        self._copy_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._copy_button.clicked.connect(self._on_copy)
+
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(SP_8)
         header.addWidget(self._prediction, alignment=Qt.AlignmentFlag.AlignLeft)
+        header.addWidget(self._copy_button, alignment=Qt.AlignmentFlag.AlignVCenter)
         header.addStretch(1)
         header.addWidget(self._score)
 
@@ -82,22 +95,6 @@ class PostCard(QFrame):
         self._chips_layout = FlowLayout(self._chips_host, spacing=SP_8)
         self._chips_host.setLayout(self._chips_layout)
 
-        self._copy_button = QToolButton()
-        self._copy_button.setObjectName("iconButton")
-        self._copy_button.setToolTip("Copy post text")
-        self._copy_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        icon = QIcon.fromTheme("edit-copy")
-        if icon.isNull():
-            icon = self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton)
-        self._copy_button.setIcon(icon)
-        self._copy_button.setText("Copy")
-        self._copy_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self._copy_button.clicked.connect(self._on_copy)
-
-        footer = QHBoxLayout()
-        footer.addStretch(1)
-        footer.addWidget(self._copy_button)
-
         layout = QVBoxLayout(self)
         layout.setContentsMargins(SP_16, SP_16, SP_16, SP_16)
         layout.setSpacing(SP_12)
@@ -107,7 +104,6 @@ class PostCard(QFrame):
         layout.addLayout(meta_row)
         layout.addWidget(self._reasons_title)
         layout.addWidget(self._chips_host)
-        layout.addLayout(footer)
 
     def set_post(self, analyzed_post: AnalyzedPost) -> None:
         post = analyzed_post.post

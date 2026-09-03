@@ -18,7 +18,7 @@ from domain.pipeline import (
     PipelineResult,
     PipelineState,
 )
-from domain.posts import CatalogPost, SOURCE_VK_CATALOG
+from domain.posts import CatalogPost, SOURCE_VK_CATALOG, post_text_key
 from ui.formatters import (
     format_post_date,
     format_reason,
@@ -39,12 +39,12 @@ if _APP is None:
 apply_theme(_APP)
 
 
-def _post(local_id: int, text: str = "text", *, views: int = 0) -> CatalogPost:
+def _post(local_id: int, text: str | None = None, *, views: int = 0) -> CatalogPost:
     return CatalogPost(
         source=SOURCE_VK_CATALOG,
         owner_id=-1,
         post_id=local_id,
-        text=text,
+        text=text if text is not None else f"text-{local_id}",
         date=datetime.fromtimestamp(1_700_000_000, tz=UTC),
         views=views,
         id=local_id,
@@ -55,7 +55,7 @@ def _analyzed(
     local_id: int,
     *,
     score: float,
-    text: str = "text",
+    text: str | None = None,
     views: int = 0,
 ) -> AnalyzedPost:
     return AnalyzedPost(
@@ -183,6 +183,61 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(window._stat_clickbait._value_label.text(), "1")
         self.assertEqual(window._stat_normal._value_label.text(), "1")
 
+    def test_next_page_uses_cursor_and_offset(self) -> None:
+        window = MainWindow()
+        window._limit_input.setValue(100)
+        self.assertFalse(window.next_page_enabled)
+
+        requests: list[PipelineRequest] = []
+        window.run_requested.connect(requests.append)
+
+        window.show_result(
+            PipelineResult(
+                posts=[_analyzed(1, score=0.9), _analyzed(2, score=0.1)],
+                collected=2,
+                analyzed=2,
+                next_from="cursor-2",
+            )
+        )
+        self.assertTrue(window.next_page_enabled)
+        self.assertEqual(window._page_range_label.text(), "Посты 1–2")
+
+        window._on_next_page_clicked()
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].start_from, "cursor-2")
+        self.assertEqual(requests[0].limit, 100)
+        self.assertEqual(window._pending_page_offset, 100)
+        self.assertIn(post_text_key("text-1"), requests[0].exclude_texts)
+        self.assertIn(post_text_key("text-2"), requests[0].exclude_texts)
+
+        window.show_result(
+            PipelineResult(
+                posts=[_analyzed(3, score=0.2)],
+                collected=1,
+                analyzed=1,
+                next_from=None,
+            )
+        )
+        self.assertEqual(window._page_range_label.text(), "Посты 101–101")
+        self.assertFalse(window.next_page_enabled)
+
+    def test_analysis_resets_pagination(self) -> None:
+        window = MainWindow()
+        requests: list[PipelineRequest] = []
+        window.run_requested.connect(requests.append)
+        window.show_result(
+            PipelineResult(
+                posts=[_analyzed(1, score=0.9)],
+                collected=1,
+                analyzed=1,
+                next_from="cursor-x",
+            )
+        )
+        self.assertTrue(window.next_page_enabled)
+        window._on_run_clicked()
+        self.assertEqual(requests[0].start_from, None)
+        self.assertFalse(window.next_page_enabled)
+
     def test_show_error(self) -> None:
         window = MainWindow()
         window.show_error("network timeout")
@@ -231,6 +286,21 @@ class ResultsViewTests(unittest.TestCase):
         self.assertEqual(
             [p.post.post_id for p in view.visible_posts()],
             [3, 2],
+        )
+
+    def test_dedupes_identical_texts(self) -> None:
+        view = ResultsView()
+        view.set_results(
+            [
+                _analyzed(1, score=0.9, text="Один и тот же текст"),
+                _analyzed(2, score=0.1, text="один и тот же   текст"),
+                _analyzed(3, score=0.8, text="Другой текст"),
+            ]
+        )
+        self.assertEqual(len(view.posts), 2)
+        self.assertEqual(
+            [p.post.post_id for p in view.posts],
+            [1, 3],
         )
 
 

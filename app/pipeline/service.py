@@ -24,6 +24,7 @@ class CatalogCollector(Protocol):
         pages: int = 1,
         page_size: int = 100,
         query: str | None = None,
+        exclude_texts: frozenset[str] | set[str] | None = None,
         on_progress=None,
     ) -> CollectResult: ...
 
@@ -99,9 +100,11 @@ class ClickbaitPipeline:
 
             collect_result = self._catalog.collect(
                 count=request.limit,
+                start_from=request.start_from,
                 pages=pages,
                 page_size=self._page_size,
                 query=query,
+                exclude_texts=request.exclude_texts,
                 on_progress=_collect_progress,
             )
             posts = list(collect_result.posts)[: request.limit]
@@ -134,6 +137,7 @@ class ClickbaitPipeline:
                 posts=analyzed_posts,
                 collected=len(posts),
                 analyzed=len(analyzed_posts),
+                next_from=collect_result.next_from,
             )
         except Exception:
             self._state = PipelineState.FAILED

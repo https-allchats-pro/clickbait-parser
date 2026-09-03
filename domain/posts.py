@@ -30,6 +30,11 @@ class CatalogPost:
 SOURCE_VK_CATALOG = "vk_catalog"
 
 
+def post_text_key(text: str) -> str:
+    """Normalize post body for uniqueness (collect / UI dedupe)."""
+    return " ".join((text or "").casefold().split())
+
+
 @dataclass
 class CatalogPage:
     posts: list[CatalogPost]

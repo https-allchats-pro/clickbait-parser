@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Protocol
 
-from domain.posts import CatalogPage, CatalogPost, CollectResult, UpsertResult
+from domain.posts import CatalogPage, CatalogPost, CollectResult, UpsertResult, post_text_key
 
 CollectProgressCallback = Callable[[int, int], None]
 
@@ -54,12 +54,15 @@ class CatalogService:
         pages: int = 1,
         page_size: int = 100,
         query: str | None = None,
+        exclude_texts: frozenset[str] | set[str] | None = None,
         on_progress: CollectProgressCallback | None = None,
     ) -> CollectResult:
-        """Fetch up to ``count`` unique posts across catalog pages.
+        """Fetch up to ``count`` posts with unique text across catalog pages.
 
         ``count`` sent to VK stays fixed for the whole run — changing it between
         pages breaks ``start_from`` cursors and yields duplicate-only pages.
+        Posts with the same normalized text are kept only once (first wins).
+        ``exclude_texts`` seeds already-seen normalized texts (e.g. previous UI page).
         """
         target = max(0, int(count))
         effective_page_size = self.VK_PAGE_SIZE
@@ -79,6 +82,7 @@ class CatalogService:
         pages_done = 0
         last_next: str | None = None
         seen: set[tuple[str, int, int]] = set()
+        seen_texts: set[str] = set(exclude_texts or ())
         stagnant_pages = 0
 
         while len(fetched_posts) < target and pages_done < max_pages:
@@ -106,6 +110,11 @@ class CatalogService:
                     if key in seen:
                         continue
                     seen.add(key)
+                    text_key = post_text_key(post.text)
+                    if text_key:
+                        if text_key in seen_texts:
+                            continue
+                        seen_texts.add(text_key)
                     loaded = self._posts.get(post.source, post.owner_id, post.post_id)
                     if loaded is not None:
                         fetched_posts.append(loaded)

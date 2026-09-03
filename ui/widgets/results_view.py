@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
 )
 
 from domain.pipeline import AnalyzedPost
+from domain.posts import post_text_key
 from ui.theme import SP_4, SP_8, SP_12
 from ui.widgets.post_card import PostCard
 
@@ -133,7 +134,7 @@ class ResultsView(QWidget):
         self._scroll.hide()
 
     def set_results(self, posts: list[AnalyzedPost]) -> None:
-        self._posts = list(posts)
+        self._posts = self._unique_by_text(posts)
         self._received_results = True
         self._render()
 
@@ -173,6 +174,11 @@ class ResultsView(QWidget):
     def current_min_views(self) -> int:
         return self._min_views
 
+    @property
+    def posts(self) -> list[AnalyzedPost]:
+        """Deduped posts currently held by the view (before filter/sort)."""
+        return list(self._posts)
+
     def visible_posts(self) -> list[AnalyzedPost]:
         posts = list(self._posts)
         if self._filter == ResultFilter.CLICKBAIT:
@@ -188,6 +194,20 @@ class ResultsView(QWidget):
         elif self._sort == ResultSort.VIEWS_ASC:
             posts.sort(key=lambda p: int(p.post.views or 0))
         return posts
+
+    @staticmethod
+    def _unique_by_text(posts: list[AnalyzedPost]) -> list[AnalyzedPost]:
+        """Keep first post for each normalized text body."""
+        unique: list[AnalyzedPost] = []
+        seen_texts: set[str] = set()
+        for item in posts:
+            key = post_text_key(item.post.text)
+            if key:
+                if key in seen_texts:
+                    continue
+                seen_texts.add(key)
+            unique.append(item)
+        return unique
 
     def _on_filter_clicked(self, button_id: int) -> None:
         mapping = {

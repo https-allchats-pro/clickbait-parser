@@ -206,7 +206,7 @@ class CatalogServiceTests(unittest.TestCase):
                             source=SOURCE_VK_CATALOG,
                             owner_id=-1,
                             post_id=i,
-                            text="x",
+                            text=f"x{i}",
                             date=datetime.fromtimestamp(1, tz=UTC),
                         )
                         for i in range(2)  # partial first page → need page 2
@@ -231,7 +231,7 @@ class CatalogServiceTests(unittest.TestCase):
                 source=source,
                 owner_id=owner_id,
                 post_id=post_id,
-                text="x",
+                text=f"x{post_id}" if post_id != 99 else "y",
                 date=datetime.fromtimestamp(1, tz=UTC),
                 id=post_id + 100,
             )
@@ -262,7 +262,7 @@ class CatalogServiceTests(unittest.TestCase):
                         source=SOURCE_VK_CATALOG,
                         owner_id=-1,
                         post_id=i,
-                        text="x",
+                        text=f"x{i}",
                         date=datetime.fromtimestamp(1, tz=UTC),
                     )
                     for i in range(20)
@@ -275,7 +275,7 @@ class CatalogServiceTests(unittest.TestCase):
                         source=SOURCE_VK_CATALOG,
                         owner_id=-1,
                         post_id=100 + i,
-                        text="y",
+                        text=f"y{i}",
                         date=datetime.fromtimestamp(2, tz=UTC),
                     )
                     for i in range(20)
@@ -290,7 +290,7 @@ class CatalogServiceTests(unittest.TestCase):
                 source=source,
                 owner_id=owner_id,
                 post_id=post_id,
-                text="x",
+                text=f"post-{post_id}",
                 date=datetime.fromtimestamp(1, tz=UTC),
                 id=post_id,
             )
@@ -302,6 +302,8 @@ class CatalogServiceTests(unittest.TestCase):
         self.assertEqual(client.get_search_top.call_count, 2)
         self.assertEqual(client.get_search_top.call_args_list[0].kwargs["count"], 50)
         self.assertEqual(client.get_search_top.call_args_list[1].kwargs["count"], 50)
+
+    def test_collect_stops_after_stagnant_duplicate_pages(self) -> None:
         client = MagicMock()
         posts_repo = MagicMock()
         posts_repo.upsert_many.return_value = type(
@@ -326,6 +328,88 @@ class CatalogServiceTests(unittest.TestCase):
         self.assertEqual(result.fetched, 1)
         # first page yields 1, next two are stagnant → stop
         self.assertEqual(client.get_search_top.call_count, 3)
+
+    def test_collect_skips_duplicate_texts(self) -> None:
+        client = MagicMock()
+        posts_repo = MagicMock()
+        posts_repo.upsert_many.return_value = type(
+            "R", (), {"inserted": 2, "updated": 0, "unchanged": 0}
+        )()
+        a = CatalogPost(
+            source=SOURCE_VK_CATALOG,
+            owner_id=-1,
+            post_id=1,
+            text="Повтор текста",
+            date=datetime.fromtimestamp(1, tz=UTC),
+            id=1,
+        )
+        b = CatalogPost(
+            source=SOURCE_VK_CATALOG,
+            owner_id=-2,
+            post_id=2,
+            text="  повтор   текста ",
+            date=datetime.fromtimestamp(2, tz=UTC),
+            id=2,
+        )
+        c = CatalogPost(
+            source=SOURCE_VK_CATALOG,
+            owner_id=-3,
+            post_id=3,
+            text="Уникальный",
+            date=datetime.fromtimestamp(3, tz=UTC),
+            id=3,
+        )
+        client.get_search_top.return_value = CatalogPage(posts=[a, b, c], next_from=None)
+
+        def _get(source: str, owner_id: int, post_id: int) -> CatalogPost:
+            return {1: a, 2: b, 3: c}[post_id]
+
+        posts_repo.get.side_effect = _get
+        service = CatalogService(client=client, posts=posts_repo)
+        result = service.collect(count=10)
+        self.assertEqual(result.fetched, 2)
+        self.assertEqual([p.post_id for p in result.posts], [1, 3])
+
+    def test_collect_exclude_texts_skips_known(self) -> None:
+        client = MagicMock()
+        posts_repo = MagicMock()
+        posts_repo.upsert_many.return_value = type(
+            "R", (), {"inserted": 1, "updated": 0, "unchanged": 0}
+        )()
+        a = CatalogPost(
+            source=SOURCE_VK_CATALOG,
+            owner_id=-1,
+            post_id=1,
+            text="Уже видели",
+            date=datetime.fromtimestamp(1, tz=UTC),
+            id=1,
+        )
+        b = CatalogPost(
+            source=SOURCE_VK_CATALOG,
+            owner_id=-2,
+            post_id=2,
+            text="Новый пост",
+            date=datetime.fromtimestamp(2, tz=UTC),
+            id=2,
+        )
+        client.get_search_top.return_value = CatalogPage(posts=[a, b], next_from=None)
+
+        def _get(source: str, owner_id: int, post_id: int) -> CatalogPost:
+            return {1: a, 2: b}[post_id]
+
+        posts_repo.get.side_effect = _get
+        service = CatalogService(client=client, posts=posts_repo)
+        result = service.collect(
+            count=10,
+            start_from="n1",
+            exclude_texts={"уже видели"},
+        )
+        self.assertEqual(result.fetched, 1)
+        self.assertEqual(result.posts[0].post_id, 2)
+        self.assertIsNone(result.next_from)
+        client.get_search_top.assert_called_once_with(
+            count=50, start_from="n1", query=None
+        )
 
 
 if __name__ == "__main__":
