@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clickbait-parser"
+version = "0.1.0"
+description = "Standalone VK clickbait post analyzer (Phase 1: auth & profiles)"
+requires-python = ">=3.11"
+dependencies = [
+  "allchats-sdk[vk]",
+  "qrcode>=7.4.2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["app*", "infrastructure*"]
