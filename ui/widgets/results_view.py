@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from enum import Enum
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QHBoxLayout,
@@ -13,6 +14,7 @@ from PyQt6.QtWidgets import (
 )
 
 from domain.pipeline import AnalyzedPost
+from ui.theme import SP_8, SP_12
 from ui.widgets.post_card import PostCard
 
 
@@ -31,19 +33,36 @@ class ResultsView(QWidget):
         self._filter = ResultFilter.ALL
         self._received_results = False
 
-        self._empty_label = QLabel("Запустите анализ, чтобы увидеть результаты")
-        self._empty_label.setWordWrap(True)
+        self._empty_title = QLabel("Запустите анализ")
+        self._empty_title.setObjectName("emptyTitle")
+        self._empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_hint = QLabel("Результаты появятся здесь после запуска.")
+        self._empty_hint.setObjectName("emptyHint")
+        self._empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_hint.setWordWrap(True)
+
+        empty_box = QVBoxLayout()
+        empty_box.setSpacing(SP_8)
+        empty_box.addStretch(1)
+        empty_box.addWidget(self._empty_title)
+        empty_box.addWidget(self._empty_hint)
+        empty_box.addStretch(2)
+        self._empty_host = QWidget()
+        self._empty_host.setLayout(empty_box)
 
         self._cards_host = QWidget()
         self._cards_layout = QVBoxLayout(self._cards_host)
         self._cards_layout.setContentsMargins(0, 0, 0, 0)
+        self._cards_layout.setSpacing(SP_12)
         self._cards_layout.addStretch(1)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self._cards_host)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setWidget(self._cards_host)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         filter_row = QHBoxLayout()
+        filter_row.setSpacing(SP_8)
         self._filter_group = QButtonGroup(self)
         self._btn_all = QPushButton("All")
         self._btn_clickbait = QPushButton("Clickbait")
@@ -51,7 +70,9 @@ class ResultsView(QWidget):
         for index, button in enumerate(
             (self._btn_all, self._btn_clickbait, self._btn_normal)
         ):
+            button.setObjectName("filterButton")
             button.setCheckable(True)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
             self._filter_group.addButton(button, index)
             filter_row.addWidget(button)
         self._btn_all.setChecked(True)
@@ -59,9 +80,12 @@ class ResultsView(QWidget):
         filter_row.addStretch(1)
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(SP_12)
         root.addLayout(filter_row)
-        root.addWidget(self._empty_label)
-        root.addWidget(scroll, stretch=1)
+        root.addWidget(self._empty_host, stretch=1)
+        root.addWidget(self._scroll, stretch=1)
+        self._scroll.hide()
 
     def set_results(self, posts: list[AnalyzedPost]) -> None:
         self._posts = list(posts)
@@ -71,8 +95,6 @@ class ResultsView(QWidget):
     def clear(self) -> None:
         self._posts = []
         self._received_results = False
-        self._empty_label.setText("Запустите анализ, чтобы увидеть результаты")
-        self._empty_label.show()
         self._render()
 
     def set_filter(self, value: ResultFilter) -> None:
@@ -111,29 +133,42 @@ class ResultsView(QWidget):
             if widget is not None:
                 widget.deleteLater()
 
+    def _show_empty(self, title: str, hint: str) -> None:
+        self._empty_title.setText(title)
+        self._empty_hint.setText(hint)
+        self._empty_host.show()
+        self._scroll.hide()
+
     def _render(self) -> None:
         self._clear_cards()
         visible = self.visible_posts()
 
         if not self._received_results:
-            self._empty_label.setText("Запустите анализ, чтобы увидеть результаты")
-            self._empty_label.show()
+            self._show_empty(
+                "Запустите анализ",
+                "Результаты появятся здесь после запуска.",
+            )
             self._cards_layout.addStretch(1)
             return
 
         if not self._posts:
-            self._empty_label.setText("Посты не найдены")
-            self._empty_label.show()
+            self._show_empty(
+                "Посты не найдены",
+                "Попробуйте изменить запрос или увеличить лимит.",
+            )
             self._cards_layout.addStretch(1)
             return
 
         if not visible:
-            self._empty_label.setText("Нет постов для выбранного фильтра")
-            self._empty_label.show()
+            self._show_empty(
+                "Нет постов для выбранного фильтра",
+                "Переключите фильтр All / Clickbait / Normal.",
+            )
             self._cards_layout.addStretch(1)
             return
 
-        self._empty_label.hide()
+        self._empty_host.hide()
+        self._scroll.show()
         for item in visible:
             card = PostCard()
             card.set_post(item)

@@ -19,14 +19,18 @@ from domain.pipeline import (
     PipelineState,
 )
 from domain.posts import CatalogPost, SOURCE_VK_CATALOG
+from ui.formatters import format_post_date, format_reason, format_score_percent, human_state
 from ui.main_window import MainWindow
 from ui.profile_dialog import ProfileSelectDialog, format_profile_label
+from ui.widgets.post_card import PostCard
 from ui.widgets.results_view import ResultFilter, ResultsView
 from app.auth.models import VKProfile
+from ui.theme import apply_theme
 
 _APP = QApplication.instance()
 if _APP is None:
     _APP = QApplication(["clickbait-parser-tests"])
+apply_theme(_APP)
 
 
 def _post(local_id: int, text: str = "text") -> CatalogPost:
@@ -141,15 +145,18 @@ class MainWindowTests(unittest.TestCase):
         window = MainWindow()
         window.set_running(True)
         self.assertFalse(window._run_button.isEnabled())
-        self.assertIn("выполняется", window._run_button.text().lower())
+        self.assertIn("анализируется", window._run_button.text().lower())
         window.set_running(False)
         self.assertTrue(window._run_button.isEnabled())
-        self.assertEqual(window._run_button.text(), "Запустить анализ")
+        self.assertEqual(window._run_button.text(), "Анализ")
 
     def test_show_result_and_empty_state(self) -> None:
         window = MainWindow()
         window.show_result(PipelineResult(posts=[], collected=0, analyzed=0))
-        self.assertIn("не найдены", window.results_view._empty_label.text().lower())
+        self.assertIn(
+            "не найдены",
+            window.results_view._empty_title.text().lower(),
+        )
 
         window.show_result(
             PipelineResult(
@@ -159,13 +166,16 @@ class MainWindowTests(unittest.TestCase):
             )
         )
         self.assertEqual(len(window.results_view.visible_posts()), 2)
+        self.assertEqual(window._stat_posts._value_label.text(), "2")
+        self.assertEqual(window._stat_clickbait._value_label.text(), "1")
+        self.assertEqual(window._stat_normal._value_label.text(), "1")
 
     def test_show_error(self) -> None:
         window = MainWindow()
         window.show_error("network timeout")
-        self.assertFalse(window._error_label.isHidden())
-        self.assertIn("FAILED", window._state_label.text())
-        self.assertIn("network timeout", window._error_label.text())
+        self.assertFalse(window._error_panel.isHidden())
+        self.assertIn("Ошибка", window._progress_title.text())
+        self.assertIn("network timeout", window._error_detail.text())
 
 
 class ResultsViewTests(unittest.TestCase):
@@ -184,6 +194,28 @@ class ResultsViewTests(unittest.TestCase):
         self.assertEqual(len(view.visible_posts()), 1)
         view.set_filter(ResultFilter.ALL)
         self.assertEqual(len(view.visible_posts()), 3)
+
+
+class FormattersTests(unittest.TestCase):
+    def test_score_and_reason_and_date(self) -> None:
+        self.assertEqual(format_score_percent(0.82), "82%")
+        self.assertEqual(format_reason("continuation_bait"), "Continuation bait")
+        when = format_post_date(datetime(2026, 9, 4, 1, 1, tzinfo=UTC))
+        self.assertIn("сент.", when)
+        self.assertIn("2026", when)
+        self.assertEqual(human_state(PipelineState.ANALYZING), "Анализ постов")
+
+
+class PostCardTests(unittest.TestCase):
+    def test_renders_percent_and_copies_text(self) -> None:
+        card = PostCard()
+        item = _analyzed(1, score=0.82, text="полный текст поста")
+        card.set_post(item)
+        self.assertEqual(card._score.text(), "82%")
+        self.assertEqual(card._prediction.text(), "CLICKBAIT")
+        card._on_copy()
+        self.assertEqual(QApplication.clipboard().text(), "полный текст поста")
+        self.assertEqual(card._copy_button.toolTip(), "Copied")
 
 
 class FakeProfileStore:

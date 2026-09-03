@@ -391,8 +391,10 @@ def _run_gui(*, profile_id: int | None, threshold: float, page_size: int) -> int
     from app.gui.controller import PipelineController
     from ui.main_window import MainWindow
     from ui.profile_dialog import ProfileSelectDialog, format_profile_label
+    from ui.theme import apply_theme
 
     app = QApplication(sys.argv)
+    apply_theme(app)
 
     # AuthService for list/delete on the GUI thread (own SQLite connection).
     auth_service = _build_auth_service(open_browser=False)
