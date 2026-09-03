@@ -53,6 +53,15 @@ class PostRepository:
             return None
         return self._row_to_post(row)
 
+    def get_by_id(self, post_id: int) -> CatalogPost | None:
+        row = self._conn.execute(
+            "SELECT * FROM posts WHERE id = ?",
+            (post_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_post(row)
+
     def get_latest(self, limit: int = 100) -> list[CatalogPost]:
         rows = self._conn.execute(
             """

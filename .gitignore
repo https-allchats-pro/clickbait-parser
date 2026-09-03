@@ -6,3 +6,5 @@ __pycache__/
 dist/
 build/
 .DS_Store
+data/*.sqlite3
+data/*.db
