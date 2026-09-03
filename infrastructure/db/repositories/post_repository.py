@@ -73,6 +73,48 @@ class PostRepository:
         ).fetchall()
         return [self._row_to_post(row) for row in rows]
 
+    def count_all(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) AS c FROM posts").fetchone()
+        return int(row["c"] if row else 0)
+
+    def get_next_unlabeled(self) -> CatalogPost | None:
+        row = self._conn.execute(
+            """
+            SELECT p.* FROM posts p
+            LEFT JOIN post_labels l ON l.post_id = p.id
+            WHERE l.id IS NULL
+            ORDER BY p.id ASC
+            LIMIT 1
+            """
+        ).fetchone()
+        return self._row_to_post(row) if row else None
+
+    def get_random_unlabeled(self) -> CatalogPost | None:
+        row = self._conn.execute(
+            """
+            SELECT p.* FROM posts p
+            LEFT JOIN post_labels l ON l.post_id = p.id
+            WHERE l.id IS NULL
+            ORDER BY RANDOM()
+            LIMIT 1
+            """
+        ).fetchone()
+        return self._row_to_post(row) if row else None
+
+    def get_suspicious_unlabeled(self) -> CatalogPost | None:
+        """Prefer unlabeled posts with highest rule-based score."""
+        row = self._conn.execute(
+            """
+            SELECT p.* FROM posts p
+            LEFT JOIN post_labels l ON l.post_id = p.id
+            LEFT JOIN post_analysis a ON a.post_id = p.id
+            WHERE l.id IS NULL
+            ORDER BY COALESCE(a.score, -1) DESC, p.id ASC
+            LIMIT 1
+            """
+        ).fetchone()
+        return self._row_to_post(row) if row else None
+
     def delete(self, source: str, owner_id: int, post_id: int) -> None:
         self._conn.execute(
             """

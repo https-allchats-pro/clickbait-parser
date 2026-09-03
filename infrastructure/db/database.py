@@ -62,6 +62,19 @@ ON post_analysis(is_clickbait);
 
 CREATE INDEX IF NOT EXISTS idx_post_analysis_score
 ON post_analysis(score);
+
+CREATE TABLE IF NOT EXISTS post_labels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    post_id INTEGER NOT NULL UNIQUE,
+    label TEXT NOT NULL,
+    note TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(post_id) REFERENCES posts(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_post_labels_label
+ON post_labels(label);
 """
 
 

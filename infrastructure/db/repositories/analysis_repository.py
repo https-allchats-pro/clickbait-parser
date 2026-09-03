@@ -62,6 +62,16 @@ class AnalysisRepository:
         ).fetchall()
         return [self._row_to_analysis(row) for row in rows]
 
+    def count_predictions(self) -> tuple[int, int]:
+        """Return (rule_clickbait_count, rule_normal_count)."""
+        clickbait = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM post_analysis WHERE is_clickbait = 1"
+        ).fetchone()
+        normal = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM post_analysis WHERE is_clickbait = 0"
+        ).fetchone()
+        return int(clickbait["c"] if clickbait else 0), int(normal["c"] if normal else 0)
+
     def _upsert_one(self, analysis: ClickbaitAnalysis, *, now: int) -> None:
         features_json = json.dumps(asdict(analysis.features), ensure_ascii=False)
         reasons_json = json.dumps(list(analysis.reasons), ensure_ascii=False)

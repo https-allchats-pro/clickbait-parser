@@ -8,3 +8,5 @@ build/
 .DS_Store
 data/*.sqlite3
 data/*.db
+dataset/*.csv
+!dataset/.gitkeep
