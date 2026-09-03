@@ -53,3 +53,4 @@ class CollectResult:
     upsert: UpsertResult
     next_from: str | None = None
     pages: int = 1
+    posts: list[CatalogPost] = field(default_factory=list)

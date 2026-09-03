@@ -168,10 +168,19 @@ class CatalogServiceTests(unittest.TestCase):
                 date=datetime.fromtimestamp(1, tz=UTC),
             )
         ]
+        loaded = CatalogPost(
+            source=SOURCE_VK_CATALOG,
+            owner_id=-1,
+            post_id=1,
+            text="a",
+            date=datetime.fromtimestamp(1, tz=UTC),
+            id=42,
+        )
         client.get_search_top.return_value = CatalogPage(posts=page_posts, next_from=None)
         posts_repo.upsert_many.return_value = type(
             "R", (), {"inserted": 1, "updated": 0, "unchanged": 0}
         )()
+        posts_repo.get.return_value = loaded
 
         service = CatalogService(client=client, posts=posts_repo)
         result = service.collect(count=100)
@@ -179,6 +188,7 @@ class CatalogServiceTests(unittest.TestCase):
         posts_repo.upsert_many.assert_called_once_with(page_posts)
         self.assertEqual(result.fetched, 1)
         self.assertEqual(result.upsert.inserted, 1)
+        self.assertEqual(result.posts[0].id, 42)
 
     def test_collect_paginates_until_count(self) -> None:
         client = MagicMock()
@@ -216,10 +226,22 @@ class CatalogServiceTests(unittest.TestCase):
                 next_from=None,
             )
 
+        def _get(source: str, owner_id: int, post_id: int) -> CatalogPost:
+            return CatalogPost(
+                source=source,
+                owner_id=owner_id,
+                post_id=post_id,
+                text="x",
+                date=datetime.fromtimestamp(1, tz=UTC),
+                id=post_id + 100,
+            )
+
         client.get_search_top.side_effect = _page
+        posts_repo.get.side_effect = _get
         service = CatalogService(client=client, posts=posts_repo)
         result = service.collect(count=3, page_size=2, pages=5)
         self.assertEqual(result.fetched, 3)
+        self.assertEqual(len(result.posts), 3)
         self.assertEqual(client.get_search_top.call_count, 2)
 
 

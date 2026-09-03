@@ -54,9 +54,10 @@ class CatalogService:
         max_pages = max(1, int(pages))
         cursor = start_from
         total_upsert = UpsertResult()
-        fetched = 0
+        fetched_posts: list[CatalogPost] = []
         pages_done = 0
         last_next: str | None = None
+        seen: set[tuple[str, int, int]] = set()
 
         while remaining > 0 and pages_done < max_pages:
             batch = min(remaining, max(1, int(page_size)))
@@ -69,7 +70,6 @@ class CatalogService:
             last_next = page.next_from
 
             batch_posts = page.posts[:remaining]
-            fetched += len(batch_posts)
             if batch_posts:
                 part = self._posts.upsert_many(batch_posts)
                 total_upsert = UpsertResult(
@@ -77,8 +77,16 @@ class CatalogService:
                     updated=total_upsert.updated + part.updated,
                     unchanged=total_upsert.unchanged + part.unchanged,
                 )
+                for post in batch_posts:
+                    key = (post.source, post.owner_id, post.post_id)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    loaded = self._posts.get(post.source, post.owner_id, post.post_id)
+                    if loaded is not None:
+                        fetched_posts.append(loaded)
 
-            remaining = count - fetched
+            remaining = count - len(fetched_posts)
             if not page.next_from or not batch_posts:
                 break
             if page.next_from == cursor:
@@ -86,10 +94,11 @@ class CatalogService:
             cursor = page.next_from
 
         return CollectResult(
-            fetched=fetched,
+            fetched=len(fetched_posts),
             upsert=total_upsert,
             next_from=last_next,
             pages=pages_done,
+            posts=fetched_posts[:count],
         )
 
     def list_latest(self, *, limit: int = 20) -> list[CatalogPost]:
