@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from infrastructure.vk.qr_display import render_ascii_qr, write_qr_html_page
+from infrastructure.vk.qr_display import render_ascii_qr, render_qr_png_bytes, write_qr_html_page
 
 
 class QrDisplayTests(unittest.TestCase):
@@ -22,6 +22,11 @@ class QrDisplayTests(unittest.TestCase):
     def test_ascii_qr_non_empty(self) -> None:
         ascii_qr = render_ascii_qr("https://qr.vk.ru/ca?q=abc")
         self.assertTrue(len(ascii_qr) > 10)
+
+    def test_png_bytes_look_like_png(self) -> None:
+        png = render_qr_png_bytes("https://qr.vk.ru/ca?q=abc")
+        self.assertTrue(png.startswith(b"\x89PNG"))
+        self.assertGreater(len(png), 100)
 
 
 if __name__ == "__main__":

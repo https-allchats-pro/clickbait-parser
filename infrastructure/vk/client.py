@@ -41,12 +41,14 @@ class VKClient:
         device_name: str = "Clickbait Parser",
         open_browser: bool = True,
         on_status: StatusCallback | None = None,
+        on_qr: Callable[[str], None] | None = None,
         poll_interval: float = POLL_INTERVAL_SEC,
         timeout_sec: float = 300.0,
     ) -> None:
         self._device_name = device_name
         self._open_browser = open_browser
         self._on_status = on_status or (lambda _msg: None)
+        self._on_qr = on_qr
         self._poll_interval = poll_interval
         self._timeout_sec = timeout_sec
         self._access_token: str | None = None
@@ -125,6 +127,12 @@ class VKClient:
         # Do NOT open auth_url in a browser — qr.vk.ru hits anti-bot / redirects.
         # Encode the URL as a QR image and let the user scan it in the VK app
         # (same approach as the AllChats frontend).
+        if self._on_qr is not None:
+            self._on_qr(auth_url)
+            self._on_status("Отсканируйте QR-код в приложении VK")
+            if not self._open_browser:
+                return
+
         ascii_qr = render_ascii_qr(auth_url)
         if ascii_qr:
             self._on_status(ascii_qr)

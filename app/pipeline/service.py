@@ -33,6 +33,9 @@ class AnalysisPersister(Protocol):
 
 ProgressCallback = Callable[[PipelineProgress], None]
 
+# catalog.getSearchStatuses often returns ~20 items even when count is larger.
+_VK_CATALOG_PAGE_HINT = 20
+
 
 class ClickbaitPipeline:
     """Orchestrates collect → analyze. No VK HTTP / SQLite / clickbait rules inside."""
@@ -57,7 +60,12 @@ class ClickbaitPipeline:
     def state(self) -> PipelineState:
         return self._state
 
-    def run(self, request: PipelineRequest) -> PipelineResult:
+    def run(
+        self,
+        request: PipelineRequest,
+        *,
+        on_progress: ProgressCallback | None = None,
+    ) -> PipelineResult:
         # Re-validate in case request was constructed without __post_init__ path.
         if request.limit <= 0:
             raise ValueError("limit must be > 0")
@@ -65,9 +73,18 @@ class ClickbaitPipeline:
         if query is not None:
             query = query.strip() or None
 
+        previous_callback = self._on_progress
+        if on_progress is not None:
+            self._on_progress = on_progress
+
         try:
             self._set_state(PipelineState.COLLECTING, current=0, total=request.limit)
-            pages = max(1, (request.limit + self._page_size - 1) // self._page_size)
+            # Budget pages for both our page_size and typical VK page size (~20).
+            pages = max(
+                1,
+                (request.limit + self._page_size - 1) // self._page_size,
+                (request.limit + _VK_CATALOG_PAGE_HINT - 1) // _VK_CATALOG_PAGE_HINT,
+            )
             collect_result = self._catalog.collect(
                 count=request.limit,
                 pages=pages,
@@ -109,6 +126,8 @@ class ClickbaitPipeline:
             self._state = PipelineState.FAILED
             self._emit(PipelineProgress(PipelineState.FAILED, 0, request.limit))
             raise
+        finally:
+            self._on_progress = previous_callback
 
     def _set_state(self, state: PipelineState, *, current: int, total: int) -> None:
         self._state = state

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI entrypoint for clickbait-parser (auth, catalog, analysis, dataset, pipeline)."""
+"""CLI entrypoint for clickbait-parser (auth, catalog, analysis, dataset, pipeline, gui)."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from analysis.analyzer import RuleBasedClickbaitAnalyzer
 from app.analysis.service import AnalysisService
 from app.auth.service import AuthService
 from app.catalog.service import CatalogService
+from app.composition import create_clickbait_pipeline
 from app.dataset.service import DatasetService
 from app.pipeline.service import ClickbaitPipeline
 from domain.dataset import DatasetLabel
@@ -35,7 +36,7 @@ DEFAULT_DATASET_CSV = Path(__file__).resolve().parent / "dataset" / "clickbait_d
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="clickbait-parser",
-        description="VK clickbait analyzer — auth, catalog, analysis, dataset, pipeline",
+        description="VK clickbait analyzer — auth, catalog, analysis, dataset, pipeline, gui",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -120,6 +121,11 @@ def build_parser() -> argparse.ArgumentParser:
     prun.add_argument("--profile-id", type=int, default=None)
     prun.add_argument("--threshold", type=float, default=0.5)
     prun.add_argument("--page-size", type=int, default=100)
+
+    gui = sub.add_parser("gui", help="Open PyQt6 desktop MVP")
+    gui.add_argument("--profile-id", type=int, default=None)
+    gui.add_argument("--threshold", type=float, default=0.5)
+    gui.add_argument("--page-size", type=int, default=100)
 
     return parser
 
@@ -258,12 +264,19 @@ def _open_db():
     return conn
 
 
-def _build_auth_service(*, open_browser: bool = True) -> AuthService:
+def _build_auth_service(
+    *,
+    open_browser: bool = True,
+    on_status=None,
+    on_qr=None,
+) -> AuthService:
     conn = _open_db()
+    status_cb = on_status if on_status is not None else (lambda msg: print(msg, flush=True))
     return AuthService(
         vk_client=VKClient(
             open_browser=open_browser,
-            on_status=lambda msg: print(msg, flush=True),
+            on_status=status_cb,
+            on_qr=on_qr,
         ),
         profiles=ProfileRepository(conn),
         credentials=FileCredentialStore(),
@@ -370,6 +383,65 @@ def _run_labeling_session(*, mode: str, max_labels: int) -> int:
                 break
             print("use: c / n / b / s / q")
     return 0
+
+
+def _run_gui(*, profile_id: int | None, threshold: float, page_size: int) -> int:
+    from PyQt6.QtWidgets import QApplication, QDialog
+
+    from app.gui.controller import PipelineController
+    from ui.main_window import MainWindow
+    from ui.profile_dialog import ProfileSelectDialog, format_profile_label
+
+    app = QApplication(sys.argv)
+
+    # AuthService for list/delete on the GUI thread (own SQLite connection).
+    auth_service = _build_auth_service(open_browser=False)
+
+    def auth_factory(*, on_status=None, on_qr=None):
+        # Fresh AuthService/SQLite on the auth worker thread; QR stays in-app.
+        return _build_auth_service(
+            open_browser=False,
+            on_status=on_status,
+            on_qr=on_qr,
+        )
+
+    dialog = ProfileSelectDialog(
+        profiles=auth_service,
+        auth_factory=auth_factory,
+        initial_profile_id=profile_id,
+    )
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return 0
+
+    selected_id = dialog.selected_profile_id
+    if selected_id is None:
+        print("no profile selected", file=sys.stderr)
+        return 1
+
+    try:
+        resolved_id, token = _resolve_vk_token(profile_id=selected_id)
+    except CatalogAuthError as exc:
+        print(f"auth error: {exc}", file=sys.stderr)
+        return 1
+
+    profile = auth_service.get_profile(resolved_id)
+    title_suffix = format_profile_label(profile) if profile is not None else f"#{resolved_id}"
+
+    def pipeline_factory():
+        # Must run on the worker thread so SQLite is not shared with the GUI thread.
+        return create_clickbait_pipeline(
+            access_token=token,
+            threshold=threshold,
+            page_size=page_size,
+        )
+
+    window = MainWindow()
+    window.setWindowTitle(f"clickbait-parser — {title_suffix}")
+    window.set_controller(
+        PipelineController(window=window, pipeline_factory=pipeline_factory)
+    )
+    window.show()
+    return int(app.exec())
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -632,6 +704,16 @@ def main(argv: list[str] | None = None) -> int:
 
         parser.error(f"unknown pipeline command: {args.pipeline_command}")
         return 2
+
+    if args.command == "gui":
+        threshold = float(args.threshold)
+        if not 0.0 <= threshold <= 1.0:
+            parser.error("--threshold must be between 0 and 1")
+        return _run_gui(
+            profile_id=args.profile_id,
+            threshold=threshold,
+            page_size=args.page_size,
+        )
 
     parser.error(f"unknown command: {args.command}")
     return 2

@@ -185,6 +185,19 @@ class ClickbaitPipelineTests(unittest.TestCase):
         pipeline.run(PipelineRequest(limit=1, query="новости"))
         self.assertEqual(catalog.calls[0]["query"], "новости")
 
+    def test_requests_enough_pages_for_vk_sized_batches(self) -> None:
+        # With page_size=100 and limit=100, old formula asked for pages=1,
+        # but VK typically returns ~20 posts per page.
+        catalog = FakeCatalog([_post(i) for i in range(100)])
+        pipeline = ClickbaitPipeline(
+            catalog_service=catalog,
+            analyzer=FakeAnalyzer(),
+            page_size=100,
+        )
+        pipeline.run(PipelineRequest(limit=100))
+        self.assertGreaterEqual(catalog.calls[0]["pages"], 5)
+        self.assertEqual(catalog.calls[0]["count"], 100)
+
     def test_none_query_passed(self) -> None:
         catalog = FakeCatalog([])
         pipeline = ClickbaitPipeline(catalog_service=catalog, analyzer=FakeAnalyzer())

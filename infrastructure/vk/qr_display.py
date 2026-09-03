@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import tempfile
 from pathlib import Path
 
@@ -8,8 +9,6 @@ import qrcode.image.svg
 
 
 def render_ascii_qr(auth_url: str) -> str:
-    import io
-
     qr = qrcode.QRCode(border=1)
     qr.add_data(auth_url)
     qr.make(fit=True)
@@ -17,6 +16,22 @@ def render_ascii_qr(auth_url: str) -> str:
     # invert=True → black modules on light terminal backgrounds
     qr.print_ascii(out=buf, invert=True)
     return buf.getvalue().rstrip()
+
+
+def render_qr_png_bytes(auth_url: str, *, box_size: int = 8, border: int = 2) -> bytes:
+    """PNG bytes for embedding QR in desktop UI (scan with VK app)."""
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=box_size,
+        border=border,
+    )
+    qr.add_data(auth_url)
+    qr.make(fit=True)
+    image = qr.make_image(fill_color="black", back_color="white")
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def write_qr_html_page(auth_url: str, *, directory: Path | None = None) -> Path:
