@@ -1,0 +1,112 @@
+{
+  "catalog": {
+    "default_section": "search_statuses",
+    "sections": [
+      {
+        "id": "search_statuses",
+        "blocks": [
+          {
+            "id": "block_feed",
+            "data_type": "newsfeed_items",
+            "next_from": "search_feed~cursor_page_2",
+            "newsfeed_item_ids": ["a", "b", "c"]
+          }
+        ],
+        "next_from": "search_feed~cursor_page_2"
+      }
+    ]
+  },
+  "newsfeed_items": [
+    {
+      "id": "wrap1",
+      "item": {
+        "id": 1,
+        "post_id": 1,
+        "owner_id": -100,
+        "date": 1725400000,
+        "text": "Обычный пост со ссылкой https://example.com/a и ещё текстом",
+        "type": "post",
+        "post_type": "post",
+        "inner_type": "wall_wallpost",
+        "likes": {"count": 10},
+        "comments": {"count": 2},
+        "reposts": {"count": 1},
+        "views": {"count": 500},
+        "attachments": [
+          {
+            "type": "link",
+            "link": {
+              "url": "https://example.com/structured",
+              "title": "Example"
+            }
+          },
+          {
+            "type": "photo",
+            "photo": {
+              "id": 999001,
+              "owner_id": -100,
+              "date": 1725400000,
+              "text": ""
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "wrap2",
+      "item": {
+        "id": 2,
+        "post_id": 2,
+        "owner_id": -200,
+        "date": 1725400100,
+        "text": "",
+        "type": "post",
+        "post_type": "post",
+        "inner_type": "wall_wallpost",
+        "likes": {"count": 0},
+        "comments": {"count": 0},
+        "reposts": {"count": 0},
+        "views": {"count": 12},
+        "copy_history": [
+          {
+            "id": 99,
+            "owner_id": -999,
+            "date": 1725300000,
+            "text": "Репостнутый оригинал https://news.example.org/x",
+            "post_type": "post",
+            "attachments": []
+          }
+        ]
+      }
+    },
+    {
+      "id": "wrap3",
+      "item": {
+        "id": 3,
+        "post_id": 3,
+        "owner_id": 42,
+        "date": 1725400200,
+        "text": "Две ссылки https://a.example/1 и https://b.example/2",
+        "type": "post",
+        "post_type": "post",
+        "inner_type": "wall_wallpost",
+        "likes": {"count": 3},
+        "comments": {"count": 1},
+        "reposts": {"count": 0},
+        "views": {"count": 90},
+        "attachments": [
+          {
+            "type": "link",
+            "link": {"url": "https://a.example/1"}
+          },
+          {
+            "type": "doc",
+            "doc": {"url": "https://docs.example/file.pdf"}
+          }
+        ]
+      }
+    }
+  ],
+  "profiles": [],
+  "groups": []
+}
