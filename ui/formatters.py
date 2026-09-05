@@ -45,6 +45,12 @@ def format_score_percent(score: float) -> str:
     return f"{round(float(score) * 100)}%"
 
 
+def format_score_or_dash(score: float | None) -> str:
+    if score is None:
+        return "—"
+    return format_score_percent(score)
+
+
 def format_reason(reason: str) -> str:
     return REASON_LABELS.get(reason, reason.replace("_", " ").strip().title())
 

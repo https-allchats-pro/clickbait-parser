@@ -64,6 +64,17 @@ class LabelRepository:
             return None
         return self._row_to_label(row)
 
+    def get_by_post_ids(self, post_ids: list[int]) -> dict[int, PostLabel]:
+        ids = [int(x) for x in post_ids if x is not None]
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._conn.execute(
+            f"SELECT * FROM post_labels WHERE post_id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        return {int(row["post_id"]): self._row_to_label(row) for row in rows}
+
     def list_by_label(self, label: DatasetLabel, limit: int = 100) -> list[PostLabel]:
         rows = self._conn.execute(
             """

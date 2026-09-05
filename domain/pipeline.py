@@ -21,6 +21,9 @@ class PipelineRequest:
     query: str | None = None
     start_from: str | None = None
     exclude_texts: frozenset[str] = field(default_factory=frozenset)
+    # When > 0, the worker keeps scanning catalog pages until ``limit`` posts
+    # meet this views threshold (or the feed is exhausted).
+    min_views: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.limit, int) or isinstance(self.limit, bool):
@@ -33,12 +36,20 @@ class PipelineRequest:
             self.start_from = str(self.start_from).strip() or None
         if not isinstance(self.exclude_texts, frozenset):
             self.exclude_texts = frozenset(self.exclude_texts)
+        self.min_views = max(0, int(self.min_views or 0))
 
 
 @dataclass
 class AnalyzedPost:
+    """Post with Rules analysis and optional ML probability (0..1)."""
+
     post: CatalogPost
     analysis: ClickbaitAnalysis
+    ml_score: float | None = None
+
+    @property
+    def rules_score(self) -> float:
+        return float(self.analysis.score)
 
 
 @dataclass
@@ -47,6 +58,10 @@ class PipelineResult:
     collected: int = 0
     analyzed: int = 0
     next_from: str | None = None
+
+    @property
+    def has_more(self) -> bool:
+        return bool(self.next_from)
 
 
 @dataclass

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI entrypoint for clickbait-parser (auth, catalog, analysis, dataset, pipeline, gui)."""
+"""CLI entrypoint for clickbait-parser (auth, catalog, analysis, dataset, pipeline, ml, gui)."""
 
 from __future__ import annotations
 
@@ -18,8 +18,12 @@ from app.auth.service import AuthService
 from app.catalog.service import CatalogService
 from app.composition import create_clickbait_pipeline
 from app.dataset.service import DatasetService
+from app.ml.service import MLTrainingService
+from app.ml.storage import ModelStore
+from app.ml.trainer import LABEL_CLICKBAIT, LABEL_NORMAL
 from app.pipeline.service import ClickbaitPipeline
 from domain.dataset import DatasetLabel
+from domain.ml import MLTrainingError
 from domain.pipeline import PipelineProgress, PipelineRequest, PipelineState
 from infrastructure.credentials.store import FileCredentialStore
 from infrastructure.db.database import connect, init_schema
@@ -36,7 +40,7 @@ DEFAULT_DATASET_CSV = Path(__file__).resolve().parent / "dataset" / "clickbait_d
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="clickbait-parser",
-        description="VK clickbait analyzer — auth, catalog, analysis, dataset, pipeline, gui",
+        description="VK clickbait analyzer — auth, catalog, analysis, dataset, pipeline, ml, gui",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -121,6 +125,11 @@ def build_parser() -> argparse.ArgumentParser:
     prun.add_argument("--profile-id", type=int, default=None)
     prun.add_argument("--threshold", type=float, default=0.5)
     prun.add_argument("--page-size", type=int, default=100)
+
+    ml = sub.add_parser("ml", help="Train / inspect TF-IDF + LogisticRegression model")
+    ml_sub = ml.add_subparsers(dest="ml_command", required=True)
+    ml_sub.add_parser("train", help="Train model from human CLICKBAIT/NORMAL labels")
+    ml_sub.add_parser("info", help="Show current model version and metrics")
 
     gui = sub.add_parser("gui", help="Open PyQt6 desktop MVP")
     gui.add_argument("--profile-id", type=int, default=None)
@@ -301,6 +310,75 @@ def _build_dataset_service() -> DatasetService:
     )
 
 
+def _build_ml_service(*, store: ModelStore | None = None) -> MLTrainingService:
+    conn = _open_db()
+    return MLTrainingService(
+        posts=PostRepository(conn),
+        labels=LabelRepository(conn),
+        store=store or ModelStore(),
+    )
+
+
+def _pct(value: float) -> str:
+    return f"{value * 100:0.2f}%"
+
+
+def _print_ml_info(service: MLTrainingService) -> int:
+    info = service.get_model_info()
+    if info is None:
+        print("Model is not trained yet.")
+        return 0
+    m = info.metrics
+    when = info.trained_at.astimezone()
+    print("Model: Clickbait TF-IDF + Logistic Regression")
+    print(f"Version: v{info.version}")
+    print()
+    print(f"Trained: {when.day} {when.strftime('%b %Y %H:%M')}")
+    print()
+    print(f"Training samples: {m.train_samples}")
+    print(f"Test samples: {m.test_samples}")
+    print()
+    print(f"Accuracy:  {_pct(m.accuracy)}")
+    print(f"Precision: {_pct(m.precision)}")
+    print(f"Recall:    {_pct(m.recall)}")
+    print(f"F1:        {_pct(m.f1)}")
+    return 0
+
+
+def _run_ml_train(service: MLTrainingService) -> int:
+    print("Training model...")
+    print()
+    try:
+        texts, y = service.load_training_pairs()
+        n_clickbait = sum(1 for v in y if v == LABEL_CLICKBAIT)
+        n_normal = sum(1 for v in y if v == LABEL_NORMAL)
+        print("Dataset:")
+        print(f"  Clickbait: {n_clickbait}")
+        print(f"  Normal:    {n_normal}")
+        print()
+        result = service.train()
+    except MLTrainingError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"ml train failed: {exc}", file=sys.stderr)
+        return 1
+
+    m = result.info.metrics
+    print(f"Train: {m.train_samples}")
+    print(f"Test: {m.test_samples}")
+    print()
+    print("Model trained successfully.")
+    print()
+    print(f"Version: v{result.info.version}")
+    print()
+    print(f"Accuracy:  {_pct(m.accuracy)}")
+    print(f"Precision: {_pct(m.precision)}")
+    print(f"Recall:    {_pct(m.recall)}")
+    print(f"F1:        {_pct(m.f1)}")
+    return 0
+
+
 def _resolve_vk_token(*, profile_id: int | None) -> tuple[int, str]:
     conn = _open_db()
     profiles = ProfileRepository(conn)
@@ -389,6 +467,7 @@ def _run_gui(*, profile_id: int | None, threshold: float, page_size: int) -> int
     from PyQt6.QtWidgets import QApplication, QDialog
 
     from app.gui.controller import PipelineController
+    from app.gui.ml_controller import MLTrainController
     from ui.main_window import MainWindow
     from ui.profile_dialog import ProfileSelectDialog, format_profile_label
     from ui.theme import apply_theme
@@ -429,18 +508,30 @@ def _run_gui(*, profile_id: int | None, threshold: float, page_size: int) -> int
     profile = auth_service.get_profile(resolved_id)
     title_suffix = format_profile_label(profile) if profile is not None else f"#{resolved_id}"
 
+    model_store = ModelStore()
+
     def pipeline_factory():
         # Must run on the worker thread so SQLite is not shared with the GUI thread.
         return create_clickbait_pipeline(
             access_token=token,
             threshold=threshold,
             page_size=page_size,
+            model_store=model_store,
         )
+
+    def ml_factory():
+        # Fresh SQLite on the ML worker thread.
+        return _build_ml_service(store=model_store)
 
     window = MainWindow()
     window.setWindowTitle(f"clickbait-parser — {title_suffix}")
+    window.set_dataset_service(_build_dataset_service())
+    window.set_ml_service(_build_ml_service(store=model_store))
     window.set_controller(
         PipelineController(window=window, pipeline_factory=pipeline_factory)
+    )
+    window.set_ml_controller(
+        MLTrainController(window=window, train_factory=ml_factory)
     )
     window.show()
     return int(app.exec())
@@ -705,6 +796,15 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         parser.error(f"unknown pipeline command: {args.pipeline_command}")
+        return 2
+
+    if args.command == "ml":
+        service = _build_ml_service()
+        if args.ml_command == "train":
+            return _run_ml_train(service)
+        if args.ml_command == "info":
+            return _print_ml_info(service)
+        parser.error(f"unknown ml command: {args.ml_command}")
         return 2
 
     if args.command == "gui":

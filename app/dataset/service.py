@@ -3,11 +3,11 @@ from __future__ import annotations
 import csv
 import json
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Literal
 
-from analysis.models import ClickbaitAnalysis
+from analysis.models import ClickbaitAnalysis, ClickbaitFeatures
 from domain.dataset import (
     MAX_IMBALANCE_RATIO,
     MIN_CLICKBAIT_FOR_ML,
@@ -17,6 +17,7 @@ from domain.dataset import (
     DatasetValidation,
     PostLabel,
 )
+from domain.pipeline import AnalyzedPost
 from domain.posts import CatalogPost
 from infrastructure.db.repositories.analysis_repository import AnalysisRepository
 from infrastructure.db.repositories.label_repository import LabelRepository
@@ -61,6 +62,41 @@ class DatasetService:
             )
         )
 
+    def label_analyzed_post(
+        self,
+        item: AnalyzedPost,
+        label: DatasetLabel,
+        note: str | None = None,
+    ) -> AnalyzedPost:
+        """Persist post + rule analysis + human label. Returns item with real DB ids.
+
+        Used by the GUI feed which keeps unlabeled results in memory only.
+        """
+        if not isinstance(label, DatasetLabel):
+            raise ValueError(f"invalid label: {label!r}")
+
+        # Strip ephemeral/session id so upsert keys on source/owner/post_id.
+        to_save = replace(item.post, id=None)
+        real_id = self._posts.upsert(to_save)
+        saved_post = self._posts.get_by_id(real_id)
+        if saved_post is None or saved_post.id is None:
+            raise RuntimeError("failed to persist labeled post")
+
+        analysis = replace(item.analysis, post_id=real_id)
+        self._analyses.save(analysis)
+
+        now = int(time.time())
+        self._labels.save(
+            PostLabel(
+                post_id=real_id,
+                label=label,
+                note=note,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        return AnalyzedPost(post=saved_post, analysis=analysis, ml_score=item.ml_score)
+
     def get_next_unlabeled_post(self, *, mode: LabelMode = "default") -> CatalogPost | None:
         if mode == "random":
             return self._posts.get_random_unlabeled()
@@ -77,6 +113,39 @@ class DatasetService:
         analysis = self._analyses.get_by_post_id(post.id)
         existing = self._labels.get_by_post_id(post.id)
         return post, analysis, existing
+
+    def get_labels_for_posts(self, post_ids: list[int]) -> dict[int, DatasetLabel]:
+        # Ephemeral (negative) session ids are never stored in SQLite.
+        real_ids = [int(pid) for pid in post_ids if pid is not None and int(pid) > 0]
+        if not real_ids:
+            return {}
+        found = self._labels.get_by_post_ids(real_ids)
+        return {post_id: label.label for post_id, label in found.items()}
+
+    def list_labeled_analyzed(self, *, limit: int = 5_000) -> tuple[list, dict[int, DatasetLabel]]:
+        """Load labeled posts with rule analysis (stub analysis if missing).
+
+        Returns ``(analyzed_posts, human_labels)`` for GUI display.
+        """
+        labels = self._labels.list_all(limit=limit)
+        analyzed: list[AnalyzedPost] = []
+        human: dict[int, DatasetLabel] = {}
+        for label in labels:
+            post = self._posts.get_by_id(label.post_id)
+            if post is None or post.id is None:
+                continue
+            analysis = self._analyses.get_by_post_id(post.id)
+            if analysis is None:
+                analysis = ClickbaitAnalysis(
+                    post_id=post.id,
+                    score=0.0,
+                    is_clickbait=False,
+                    reasons=[],
+                    features=ClickbaitFeatures(),
+                )
+            analyzed.append(AnalyzedPost(post=post, analysis=analysis))
+            human[post.id] = label.label
+        return analyzed, human
 
     def get_dataset_stats(self) -> DatasetStats:
         by_label = self._labels.count_by_label()

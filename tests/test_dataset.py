@@ -10,6 +10,7 @@ from pathlib import Path
 from analysis.models import ClickbaitAnalysis, ClickbaitFeatures
 from app.dataset.service import DatasetService
 from domain.dataset import DatasetLabel
+from domain.pipeline import AnalyzedPost
 from domain.posts import SOURCE_VK_CATALOG, CatalogPost, PostLink
 from infrastructure.db.database import init_schema
 from infrastructure.db.repositories.analysis_repository import AnalysisRepository
@@ -99,7 +100,41 @@ class LabelRepositoryTests(unittest.TestCase):
         self.assertEqual(counts[DatasetLabel.BORDERLINE], 1)
         self.assertEqual(len(self.labels.list_by_label(DatasetLabel.CLICKBAIT)), 1)
 
-    def test_cascade_delete(self) -> None:
+    def test_get_by_post_ids(self) -> None:
+        from domain.dataset import PostLabel
+        import time
+
+        now = int(time.time())
+        second = self.posts.upsert(
+            CatalogPost(
+                source=SOURCE_VK_CATALOG,
+                owner_id=-1,
+                post_id=11,
+                text="b",
+                date=datetime.fromtimestamp(2, tz=UTC),
+            )
+        )
+        self.labels.save(
+            PostLabel(
+                post_id=self.post_id,
+                label=DatasetLabel.CLICKBAIT,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        self.labels.save(
+            PostLabel(
+                post_id=second,
+                label=DatasetLabel.NORMAL,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        found = self.labels.get_by_post_ids([self.post_id, second, 999])
+        self.assertEqual(len(found), 2)
+        self.assertEqual(found[self.post_id].label, DatasetLabel.CLICKBAIT)
+        self.assertEqual(found[second].label, DatasetLabel.NORMAL)
+
         from domain.dataset import PostLabel
         import time
 
@@ -240,12 +275,53 @@ class DatasetServiceTests(unittest.TestCase):
         self.assertIn("has_continuation_phrase", rows[0]["features"])
         self.assertEqual(rows[0]["post_id_vk"], "1")
 
+    def test_list_labeled_analyzed(self) -> None:
+        self.service.label_post(self.p1, DatasetLabel.CLICKBAIT)
+        self.service.label_post(self.p2, DatasetLabel.NORMAL)
+        posts, labels = self.service.list_labeled_analyzed()
+        self.assertEqual(len(posts), 2)
+        self.assertEqual(labels[self.p1], DatasetLabel.CLICKBAIT)
+        self.assertEqual(labels[self.p2], DatasetLabel.NORMAL)
+        by_id = {p.post.id: p for p in posts}
+        self.assertTrue(by_id[self.p1].analysis.is_clickbait)
+
     def test_validate_warnings(self) -> None:
         result = self.service.validate()
         self.assertTrue(any("No labeled" in w for w in result.warnings))
         self.service.label_post(self.p1, DatasetLabel.CLICKBAIT)
         result2 = self.service.validate()
         self.assertTrue(any("clickbait examples" in w for w in result2.warnings))
+
+    def test_label_analyzed_post_persists_ephemeral(self) -> None:
+        ephemeral = CatalogPost(
+            source=SOURCE_VK_CATALOG,
+            owner_id=-99,
+            post_id=777,
+            text="only labeled lands in db",
+            date=datetime.fromtimestamp(1_700_000_300, tz=UTC),
+            id=-5,
+        )
+        item = AnalyzedPost(
+            post=ephemeral,
+            analysis=ClickbaitAnalysis(
+                post_id=-5,
+                score=0.8,
+                is_clickbait=True,
+                reasons=["continuation_bait"],
+                features=ClickbaitFeatures(has_continuation_phrase=True),
+            ),
+        )
+        before = self.posts.count_all()
+        saved = self.service.label_analyzed_post(item, DatasetLabel.CLICKBAIT)
+        self.assertIsNotNone(saved.post.id)
+        self.assertGreater(saved.post.id, 0)
+        self.assertEqual(saved.analysis.post_id, saved.post.id)
+        self.assertEqual(self.posts.count_all(), before + 1)
+        labels = self.service.get_labels_for_posts([saved.post.id])
+        self.assertEqual(labels[saved.post.id], DatasetLabel.CLICKBAIT)
+        analysis = self.analyses.get_by_post_id(saved.post.id)
+        self.assertIsNotNone(analysis)
+        self.assertTrue(analysis.is_clickbait)
 
 
 if __name__ == "__main__":

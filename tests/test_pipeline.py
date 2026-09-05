@@ -16,13 +16,20 @@ from domain.pipeline import (
 from domain.posts import CatalogPost, CollectResult, SOURCE_VK_CATALOG, UpsertResult
 
 
-def _post(post_id: int, *, local_id: int | None = None, text: str = "hello") -> CatalogPost:
+def _post(
+    post_id: int,
+    *,
+    local_id: int | None = None,
+    text: str = "hello",
+    views: int = 0,
+) -> CatalogPost:
     return CatalogPost(
         source=SOURCE_VK_CATALOG,
         owner_id=-100,
         post_id=post_id,
         text=text,
         date=datetime.fromtimestamp(1_700_000_000, tz=UTC),
+        views=views,
         id=local_id if local_id is not None else post_id,
     )
 
@@ -280,6 +287,111 @@ class ClickbaitPipelineTests(unittest.TestCase):
         self.assertEqual(catalog.calls[0]["start_from"], "cursor-a")
         self.assertEqual(catalog.calls[0]["exclude_texts"], frozenset({"hello"}))
         self.assertEqual(result.next_from, "next-2")
+
+    def test_min_views_keeps_scanning_batches(self) -> None:
+        pages = [
+            [_post(1, text="a", views=10), _post(2, text="b", views=20)],
+            [_post(3, text="c", views=5_000), _post(4, text="d", views=10)],
+            [_post(5, text="e", views=9_000)],
+        ]
+        catalog = PagingFakeCatalog(pages)
+        pipeline = ClickbaitPipeline(
+            catalog_service=catalog,
+            analyzer=FakeAnalyzer(),
+            page_size=2,
+        )
+        with unittest.mock.patch.object(
+            ClickbaitPipeline, "_min_views_delay", return_value=0
+        ):
+            result = pipeline.run(PipelineRequest(limit=2, min_views=1_000))
+        self.assertEqual(len(result.posts), 2)
+        self.assertEqual([p.post.post_id for p in result.posts], [3, 5])
+        self.assertGreaterEqual(len(catalog.calls), 2)
+        self.assertEqual(result.collected, 5)
+
+    def test_min_views_continues_on_empty_batch_with_cursor(self) -> None:
+        pages = [
+            [],  # empty round, but cursor advances
+            [_post(10, text="hot", views=8_000)],
+        ]
+        catalog = PagingFakeCatalog(pages)
+        pipeline = ClickbaitPipeline(
+            catalog_service=catalog,
+            analyzer=FakeAnalyzer(),
+            page_size=2,
+        )
+        with unittest.mock.patch.object(
+            ClickbaitPipeline, "_min_views_delay", return_value=0
+        ):
+            result = pipeline.run(PipelineRequest(limit=1, min_views=1_000))
+        self.assertEqual(len(result.posts), 1)
+        self.assertEqual(result.posts[0].post.post_id, 10)
+        self.assertEqual(len(catalog.calls), 2)
+
+    def test_min_views_stops_when_feed_exhausted(self) -> None:
+        catalog = FakeCatalog(
+            [_post(1, text="a", views=10), _post(2, text="b", views=20)],
+            next_from=None,
+        )
+        pipeline = ClickbaitPipeline(catalog_service=catalog, analyzer=FakeAnalyzer())
+        with unittest.mock.patch.object(
+            ClickbaitPipeline, "_min_views_delay", return_value=0
+        ):
+            result = pipeline.run(PipelineRequest(limit=5, min_views=1_000))
+        self.assertEqual(result.posts, [])
+        self.assertEqual(result.collected, 2)
+        self.assertIsNone(result.next_from)
+
+
+class PagingFakeCatalog:
+    """Returns a different page per collect() call, advancing cursors."""
+
+    def __init__(self, pages: list[list[CatalogPost]]) -> None:
+        self.pages = pages
+        self.calls: list[dict[str, Any]] = []
+
+    def collect(
+        self,
+        *,
+        count: int = 100,
+        start_from: str | None = None,
+        pages: int = 1,
+        page_size: int = 100,
+        query: str | None = None,
+        exclude_texts: frozenset[str] | set[str] | None = None,
+        on_progress=None,
+    ) -> CollectResult:
+        index = 0
+        if start_from and start_from.startswith("p"):
+            index = int(start_from[1:])
+        self.calls.append(
+            {
+                "count": count,
+                "start_from": start_from,
+                "pages": pages,
+                "page_size": page_size,
+                "query": query,
+                "exclude_texts": frozenset(exclude_texts or ()),
+            }
+        )
+        if index >= len(self.pages):
+            return CollectResult(
+                fetched=0,
+                upsert=UpsertResult(inserted=0),
+                posts=[],
+                next_from=None,
+            )
+        batch = self.pages[index][:count]
+        if on_progress is not None:
+            on_progress(len(batch), count)
+        next_index = index + 1
+        next_from = f"p{next_index}" if next_index < len(self.pages) else None
+        return CollectResult(
+            fetched=len(batch),
+            upsert=UpsertResult(inserted=len(batch)),
+            posts=list(batch),
+            next_from=next_from,
+        )
 
 
 if __name__ == "__main__":

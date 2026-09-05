@@ -59,3 +59,7 @@ class CollectResult:
     next_from: str | None = None
     pages: int = 1
     posts: list[CatalogPost] = field(default_factory=list)
+
+    @property
+    def has_more(self) -> bool:
+        return bool(self.next_from)

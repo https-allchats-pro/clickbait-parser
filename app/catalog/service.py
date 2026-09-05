@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Protocol
 
 from domain.posts import CatalogPage, CatalogPost, CollectResult, UpsertResult, post_text_key
@@ -32,7 +33,7 @@ class PostRepositoryProtocol(Protocol):
 
 
 class CatalogService:
-    """Collect global VK catalog posts into local storage."""
+    """Collect global VK catalog posts (optionally into local storage)."""
 
     # newsfeed.search paginates well with up to 50–100 items per page.
     VK_PAGE_SIZE = 50
@@ -41,10 +42,16 @@ class CatalogService:
         self,
         *,
         client: CatalogClientProtocol,
-        posts: PostRepositoryProtocol,
+        posts: PostRepositoryProtocol | None = None,
+        persist_posts: bool = True,
     ) -> None:
+        if persist_posts and posts is None:
+            raise ValueError("posts repository is required when persist_posts=True")
         self._client = client
         self._posts = posts
+        self._persist_posts = bool(persist_posts)
+        # Negative session ids for in-memory GUI feed (never collide with SQLite ids).
+        self._ephemeral_id = 0
 
     def collect(
         self,
@@ -63,6 +70,9 @@ class CatalogService:
         pages breaks ``start_from`` cursors and yields duplicate-only pages.
         Posts with the same normalized text are kept only once (first wins).
         ``exclude_texts`` seeds already-seen normalized texts (e.g. previous UI page).
+
+        When ``persist_posts`` is False, posts stay in memory with ephemeral ids
+        and are not written to SQLite.
         """
         target = max(0, int(count))
         effective_page_size = self.VK_PAGE_SIZE
@@ -96,44 +106,58 @@ class CatalogService:
 
             batch_posts = page.posts
             new_in_page = 0
-            if batch_posts:
+            if batch_posts and self._persist_posts and self._posts is not None:
                 part = self._posts.upsert_many(batch_posts)
                 total_upsert = UpsertResult(
                     inserted=total_upsert.inserted + part.inserted,
                     updated=total_upsert.updated + part.updated,
                     unchanged=total_upsert.unchanged + part.unchanged,
                 )
-                for post in batch_posts:
-                    if len(fetched_posts) >= target:
-                        break
-                    key = (post.source, post.owner_id, post.post_id)
-                    if key in seen:
+
+            for post in batch_posts:
+                if len(fetched_posts) >= target:
+                    break
+                key = (post.source, post.owner_id, post.post_id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                text_key = post_text_key(post.text)
+                if text_key:
+                    if text_key in seen_texts:
                         continue
-                    seen.add(key)
-                    text_key = post_text_key(post.text)
-                    if text_key:
-                        if text_key in seen_texts:
-                            continue
-                        seen_texts.add(text_key)
+                    seen_texts.add(text_key)
+
+                if self._persist_posts and self._posts is not None:
                     loaded = self._posts.get(post.source, post.owner_id, post.post_id)
-                    if loaded is not None:
-                        fetched_posts.append(loaded)
-                        new_in_page += 1
+                    if loaded is None:
+                        continue
+                    fetched_posts.append(loaded)
+                else:
+                    self._ephemeral_id -= 1
+                    fetched_posts.append(replace(post, id=self._ephemeral_id))
+                new_in_page += 1
 
             if on_progress is not None:
                 on_progress(len(fetched_posts), target)
 
             if not batch_posts:
+                last_next = None
+                break
+            if len(fetched_posts) >= target:
+                # Keep last_next so the UI can request the following page.
                 break
             if new_in_page == 0:
                 stagnant_pages += 1
-                if stagnant_pages >= 2:
+                # Be patient: newsfeed often repeats before the cursor moves on.
+                if stagnant_pages >= 5:
                     break
             else:
                 stagnant_pages = 0
             if not page.next_from:
+                last_next = None
                 break
             if page.next_from == cursor:
+                last_next = None
                 break
             cursor = page.next_from
 
@@ -146,4 +170,6 @@ class CatalogService:
         )
 
     def list_latest(self, *, limit: int = 20) -> list[CatalogPost]:
+        if self._posts is None:
+            return []
         return self._posts.get_latest(limit=limit)

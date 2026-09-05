@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-"""Central dark theme for the PyQt6 UI (presentation only)."""
+"""Central themes for the PyQt6 UI (presentation only)."""
 
+from typing import Literal
+
+from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import QApplication, QWidget
 
 # Spacing scale
@@ -11,7 +14,14 @@ SP_12 = 12
 SP_16 = 16
 SP_24 = 24
 
-COLORS = {
+ThemeName = Literal["dark", "light"]
+
+_SETTINGS_ORG = "clickbait-parser"
+_SETTINGS_APP = "ui"
+_SETTINGS_KEY = "theme"
+_DEFAULT_THEME: ThemeName = "dark"
+
+DARK_COLORS: dict[str, str] = {
     "bg": "#1c1c1e",
     "bg_elevated": "#2c2c2e",
     "bg_input": "#3a3a3c",
@@ -25,29 +35,98 @@ COLORS = {
     "clickbait": "#ff453a",
     "normal": "#30d158",
     "chip_bg": "#48484a",
+    "error_bg": "#3a1f1f",
+    "error_border": "#5c2b2b",
+    "button_hover": "#48484a",
+    "button_pressed": "#3a3a3c",
+    "button_disabled_bg": "#2c2c2e",
+    "button_disabled_text": "#636366",
+    "primary_disabled_bg": "#3a3a3c",
+    "primary_disabled_text": "#8e8e93",
+    "scrollbar": "#48484a",
+    "clickbait_soft": "rgba(255, 69, 58, 0.18)",
+    "normal_soft": "rgba(48, 209, 88, 0.18)",
+    "borderline_soft": "rgba(152, 152, 157, 0.22)",
+    "primary_text": "#ffffff",
 }
 
+LIGHT_COLORS: dict[str, str] = {
+    "bg": "#f5f5f7",
+    "bg_elevated": "#ffffff",
+    "bg_input": "#e8e8ed",
+    "border": "#d2d2d7",
+    "text": "#1d1d1f",
+    "text_secondary": "#6e6e73",
+    "accent": "#0071e3",
+    "accent_hover": "#0077ed",
+    "accent_pressed": "#0058b0",
+    "danger": "#d70015",
+    "clickbait": "#d70015",
+    "normal": "#248a3d",
+    "chip_bg": "#e5e5ea",
+    "error_bg": "#fff2f2",
+    "error_border": "#ffc9c9",
+    "button_hover": "#dcdce0",
+    "button_pressed": "#d2d2d7",
+    "button_disabled_bg": "#f0f0f2",
+    "button_disabled_text": "#aeaeb2",
+    "primary_disabled_bg": "#d2d2d7",
+    "primary_disabled_text": "#8e8e93",
+    "scrollbar": "#c7c7cc",
+    "clickbait_soft": "rgba(215, 0, 21, 0.12)",
+    "normal_soft": "rgba(36, 138, 61, 0.12)",
+    "borderline_soft": "rgba(110, 110, 115, 0.14)",
+    "primary_text": "#ffffff",
+}
 
-APP_STYLESHEET = f"""
+THEMES: dict[ThemeName, dict[str, str]] = {
+    "dark": DARK_COLORS,
+    "light": LIGHT_COLORS,
+}
+
+# Mutable module state — updated by apply_theme.
+COLORS: dict[str, str] = dict(DARK_COLORS)
+CURRENT_THEME: ThemeName = _DEFAULT_THEME
+APP_STYLESHEET = ""
+
+
+def _normalize_theme(name: str | None) -> ThemeName:
+    if name == "light":
+        return "light"
+    return "dark"
+
+
+def load_saved_theme() -> ThemeName:
+    settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+    return _normalize_theme(settings.value(_SETTINGS_KEY, _DEFAULT_THEME))
+
+
+def save_theme(name: ThemeName) -> None:
+    settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+    settings.setValue(_SETTINGS_KEY, name)
+
+
+def build_stylesheet(colors: dict[str, str]) -> str:
+    return f"""
 QWidget {{
-    background-color: {COLORS["bg"]};
-    color: {COLORS["text"]};
+    background-color: {colors["bg"]};
+    color: {colors["text"]};
     font-size: 13px;
 }}
 
 QMainWindow, QDialog {{
-    background-color: {COLORS["bg"]};
+    background-color: {colors["bg"]};
 }}
 
 QLabel#sectionLabel {{
-    color: {COLORS["text_secondary"]};
+    color: {colors["text_secondary"]};
     font-size: 11px;
     font-weight: 600;
     letter-spacing: 0.3px;
 }}
 
 QLabel#secondaryLabel {{
-    color: {COLORS["text_secondary"]};
+    color: {colors["text_secondary"]};
     font-size: 12px;
 }}
 
@@ -57,12 +136,12 @@ QLabel#progressTitle {{
 }}
 
 QLabel#progressCount {{
-    color: {COLORS["text_secondary"]};
+    color: {colors["text_secondary"]};
     font-size: 12px;
 }}
 
 QLabel#statusFooter {{
-    color: {COLORS["text_secondary"]};
+    color: {colors["text_secondary"]};
     font-size: 12px;
 }}
 
@@ -72,7 +151,7 @@ QLabel#statValue {{
 }}
 
 QLabel#statCaption {{
-    color: {COLORS["text_secondary"]};
+    color: {colors["text_secondary"]};
     font-size: 11px;
 }}
 
@@ -82,43 +161,49 @@ QLabel#emptyTitle {{
 }}
 
 QLabel#emptyHint {{
-    color: {COLORS["text_secondary"]};
+    color: {colors["text_secondary"]};
     font-size: 13px;
 }}
 
 QLabel#errorTitle {{
-    color: {COLORS["danger"]};
+    color: {colors["danger"]};
     font-size: 14px;
     font-weight: 600;
 }}
 
 QLabel#errorDetail {{
-    color: {COLORS["text_secondary"]};
+    color: {colors["text_secondary"]};
     font-size: 12px;
 }}
 
 QFrame#panel, QFrame#statCard, QFrame#postCard {{
-    background-color: {COLORS["bg_elevated"]};
-    border: 1px solid {COLORS["border"]};
+    background-color: {colors["bg_elevated"]};
+    border: 1px solid {colors["border"]};
     border-radius: 12px;
 }}
 
 QFrame#errorPanel {{
-    background-color: #3a1f1f;
-    border: 1px solid #5c2b2b;
+    background-color: {colors["error_bg"]};
+    border: 1px solid {colors["error_border"]};
     border-radius: 12px;
 }}
 
+QFrame#cardDivider {{
+    background-color: {colors["border"]};
+    border: none;
+    max-height: 1px;
+}}
+
 QLineEdit, QSpinBox, QComboBox, QListWidget {{
-    background-color: {COLORS["bg_input"]};
-    border: 1px solid {COLORS["border"]};
+    background-color: {colors["bg_input"]};
+    border: 1px solid {colors["border"]};
     border-radius: 8px;
     padding: 8px 10px;
-    selection-background-color: {COLORS["accent"]};
+    selection-background-color: {colors["accent"]};
 }}
 
 QLineEdit:focus, QSpinBox:focus, QComboBox:focus {{
-    border: 1px solid {COLORS["accent"]};
+    border: 1px solid {colors["accent"]};
 }}
 
 QComboBox::drop-down {{
@@ -127,9 +212,9 @@ QComboBox::drop-down {{
 }}
 
 QComboBox QAbstractItemView {{
-    background-color: {COLORS["bg_elevated"]};
-    border: 1px solid {COLORS["border"]};
-    selection-background-color: {COLORS["accent"]};
+    background-color: {colors["bg_elevated"]};
+    border: 1px solid {colors["border"]};
+    selection-background-color: {colors["accent"]};
 }}
 
 QSpinBox::up-button, QSpinBox::down-button {{
@@ -137,46 +222,46 @@ QSpinBox::up-button, QSpinBox::down-button {{
 }}
 
 QPushButton {{
-    background-color: {COLORS["bg_input"]};
-    border: 1px solid {COLORS["border"]};
+    background-color: {colors["bg_input"]};
+    border: 1px solid {colors["border"]};
     border-radius: 8px;
     padding: 8px 14px;
-    color: {COLORS["text"]};
+    color: {colors["text"]};
 }}
 
 QPushButton:hover {{
-    background-color: #48484a;
+    background-color: {colors["button_hover"]};
 }}
 
 QPushButton:pressed {{
-    background-color: #3a3a3c;
+    background-color: {colors["button_pressed"]};
 }}
 
 QPushButton:disabled {{
-    color: #636366;
-    background-color: #2c2c2e;
+    color: {colors["button_disabled_text"]};
+    background-color: {colors["button_disabled_bg"]};
 }}
 
 QPushButton#primaryButton {{
-    background-color: {COLORS["accent"]};
+    background-color: {colors["accent"]};
     border: none;
-    color: white;
+    color: {colors["primary_text"]};
     font-weight: 600;
     padding: 10px 18px;
     min-width: 120px;
 }}
 
 QPushButton#primaryButton:hover {{
-    background-color: {COLORS["accent_hover"]};
+    background-color: {colors["accent_hover"]};
 }}
 
 QPushButton#primaryButton:pressed {{
-    background-color: {COLORS["accent_pressed"]};
+    background-color: {colors["accent_pressed"]};
 }}
 
 QPushButton#primaryButton:disabled {{
-    background-color: #3a3a3c;
-    color: #8e8e93;
+    background-color: {colors["primary_disabled_bg"]};
+    color: {colors["primary_disabled_text"]};
 }}
 
 QPushButton#filterButton {{
@@ -184,17 +269,17 @@ QPushButton#filterButton {{
     border: none;
     border-radius: 8px;
     padding: 6px 12px;
-    color: {COLORS["text_secondary"]};
+    color: {colors["text_secondary"]};
 }}
 
 QPushButton#filterButton:hover {{
-    background-color: {COLORS["bg_input"]};
-    color: {COLORS["text"]};
+    background-color: {colors["bg_input"]};
+    color: {colors["text"]};
 }}
 
 QPushButton#filterButton:checked {{
-    background-color: {COLORS["bg_input"]};
-    color: {COLORS["text"]};
+    background-color: {colors["bg_input"]};
+    color: {colors["text"]};
     font-weight: 600;
 }}
 
@@ -207,23 +292,68 @@ QPushButton#iconButton {{
 }}
 
 QPushButton#iconButton:hover {{
-    background-color: {COLORS["bg_input"]};
+    background-color: {colors["bg_input"]};
+}}
+
+QPushButton#labelGood, QPushButton#labelBad, QPushButton#labelBorderline {{
+    background-color: {colors["bg_input"]};
+    border: 1px solid {colors["border"]};
+    border-radius: 8px;
+    padding: 6px 12px;
+    color: {colors["text_secondary"]};
+    font-weight: 500;
+}}
+
+QPushButton#labelGood:hover {{
+    color: {colors["clickbait"]};
+    border-color: {colors["clickbait"]};
+}}
+
+QPushButton#labelGood:checked {{
+    background-color: {colors["clickbait_soft"]};
+    color: {colors["clickbait"]};
+    border-color: {colors["clickbait"]};
+    font-weight: 700;
+}}
+
+QPushButton#labelBad:hover {{
+    color: {colors["normal"]};
+    border-color: {colors["normal"]};
+}}
+
+QPushButton#labelBad:checked {{
+    background-color: {colors["normal_soft"]};
+    color: {colors["normal"]};
+    border-color: {colors["normal"]};
+    font-weight: 700;
+}}
+
+QPushButton#labelBorderline:hover {{
+    color: {colors["text"]};
+    border-color: {colors["text_secondary"]};
+}}
+
+QPushButton#labelBorderline:checked {{
+    background-color: {colors["borderline_soft"]};
+    color: {colors["text"]};
+    border-color: {colors["text_secondary"]};
+    font-weight: 700;
 }}
 
 QPushButton#linkButton {{
     background-color: transparent;
     border: none;
-    color: {COLORS["accent"]};
+    color: {colors["accent"]};
     padding: 0;
     text-align: left;
 }}
 
 QPushButton#linkButton:hover {{
-    color: {COLORS["accent_hover"]};
+    color: {colors["accent_hover"]};
 }}
 
 QProgressBar {{
-    background-color: {COLORS["bg_input"]};
+    background-color: {colors["bg_input"]};
     border: none;
     border-radius: 4px;
     height: 8px;
@@ -232,7 +362,7 @@ QProgressBar {{
 }}
 
 QProgressBar::chunk {{
-    background-color: {COLORS["accent"]};
+    background-color: {colors["accent"]};
     border-radius: 4px;
 }}
 
@@ -252,7 +382,7 @@ QScrollBar:vertical {{
 }}
 
 QScrollBar::handle:vertical {{
-    background: #48484a;
+    background: {colors["scrollbar"]};
     border-radius: 5px;
     min-height: 24px;
 }}
@@ -261,9 +391,19 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
     height: 0;
 }}
 
+QSplitter#mainSplitter::handle:vertical {{
+    background: {colors["border"]};
+    margin: 4px 80px;
+    border-radius: 3px;
+}}
+
+QSplitter#mainSplitter::handle:vertical:hover {{
+    background: {colors["accent"]};
+}}
+
 QLabel#predictionClickbait {{
-    background-color: rgba(255, 69, 58, 0.18);
-    color: {COLORS["clickbait"]};
+    background-color: {colors["clickbait_soft"]};
+    color: {colors["clickbait"]};
     border-radius: 6px;
     padding: 4px 10px;
     font-weight: 700;
@@ -271,8 +411,8 @@ QLabel#predictionClickbait {{
 }}
 
 QLabel#predictionNormal {{
-    background-color: rgba(48, 209, 88, 0.18);
-    color: {COLORS["normal"]};
+    background-color: {colors["normal_soft"]};
+    color: {colors["normal"]};
     border-radius: 6px;
     padding: 4px 10px;
     font-weight: 700;
@@ -280,7 +420,7 @@ QLabel#predictionNormal {{
 }}
 
 QLabel#scoreBadge {{
-    color: {COLORS["text"]};
+    color: {colors["text"]};
     font-size: 18px;
     font-weight: 700;
 }}
@@ -291,30 +431,157 @@ QLabel#postText {{
 }}
 
 QLabel#metaLabel {{
-    color: {COLORS["text_secondary"]};
+    color: {colors["text_secondary"]};
     font-size: 12px;
 }}
 
 QLabel#reasonChip {{
-    background-color: {COLORS["chip_bg"]};
-    color: {COLORS["text"]};
+    background-color: {colors["chip_bg"]};
+    color: {colors["text"]};
     border-radius: 10px;
     padding: 4px 10px;
     font-size: 11px;
 }}
 
 QLabel#reasonsTitle {{
-    color: {COLORS["text_secondary"]};
+    color: {colors["text_secondary"]};
     font-size: 11px;
     font-weight: 600;
+}}
+
+QTabWidget::pane {{
+    border: none;
+    background: transparent;
+    top: -1px;
+}}
+
+QTabBar::tab {{
+    background: transparent;
+    color: {colors["text_secondary"]};
+    padding: 8px 16px;
+    margin-right: 4px;
+    border: none;
+    border-bottom: 2px solid transparent;
+    font-weight: 500;
+}}
+
+QTabBar::tab:hover {{
+    color: {colors["text"]};
+}}
+
+QTabBar::tab:selected {{
+    color: {colors["text"]};
+    border-bottom: 2px solid {colors["accent"]};
+    font-weight: 600;
+}}
+
+QLabel#insightsTitle {{
+    font-size: 18px;
+    font-weight: 600;
+}}
+
+QLabel#insightsAlgo {{
+    font-size: 15px;
+    font-weight: 600;
+}}
+
+QLabel#insightsHowTo {{
+    color: {colors["text_secondary"]};
+    font-size: 12px;
+    line-height: 1.4;
+}}
+
+QLabel#insightsClickbaitHead {{
+    color: {colors["clickbait"]};
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.4px;
+}}
+
+QLabel#insightsNormalHead {{
+    color: {colors["normal"]};
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.4px;
+}}
+
+QLabel#featureTerm {{
+    font-size: 12px;
+    color: {colors["text"]};
+}}
+
+QLabel#featureCoefClickbait {{
+    color: {colors["clickbait"]};
+    font-size: 12px;
+    font-weight: 600;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}}
+
+QLabel#featureCoefNormal {{
+    color: {colors["normal"]};
+    font-size: 12px;
+    font-weight: 600;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}}
+
+QProgressBar#featureBarClickbait {{
+    background-color: {colors["bg_input"]};
+    border: none;
+    border-radius: 4px;
+    max-height: 8px;
+}}
+
+QProgressBar#featureBarClickbait::chunk {{
+    background-color: {colors["clickbait"]};
+    border-radius: 4px;
+}}
+
+QProgressBar#featureBarNormal {{
+    background-color: {colors["bg_input"]};
+    border: none;
+    border-radius: 4px;
+    max-height: 8px;
+}}
+
+QProgressBar#featureBarNormal::chunk {{
+    background-color: {colors["normal"]};
+    border-radius: 4px;
 }}
 """
 
 
-def apply_theme(app: QApplication) -> None:
+def apply_theme(
+    app: QApplication,
+    theme: ThemeName | None = None,
+    *,
+    persist: bool = True,
+) -> ThemeName:
+    global COLORS, CURRENT_THEME, APP_STYLESHEET
+
+    name = _normalize_theme(theme if theme is not None else load_saved_theme())
+    COLORS = dict(THEMES[name])
+    CURRENT_THEME = name
+    APP_STYLESHEET = build_stylesheet(COLORS)
+
     app.setStyle("Fusion")
     app.setStyleSheet(APP_STYLESHEET)
+    if persist:
+        save_theme(name)
+    return name
+
+
+def get_current_theme() -> ThemeName:
+    return CURRENT_THEME
+
+
+def toggle_theme(app: QApplication) -> ThemeName:
+    next_theme: ThemeName = "light" if CURRENT_THEME == "dark" else "dark"
+    return apply_theme(app, next_theme)
 
 
 def set_object_name(widget: QWidget, name: str) -> None:
     widget.setObjectName(name)
+
+
+# Build default stylesheet so APP_STYLESHEET is never empty for importers.
+APP_STYLESHEET = build_stylesheet(COLORS)

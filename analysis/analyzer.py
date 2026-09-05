@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol, Sequence
 
-from analysis.models import ClickbaitAnalysis, ClickbaitFeatures
+from analysis.models import ClickbaitAnalysis, ClickbaitFeatures, RuleContribution
 from analysis.rules import default_rules
 from analysis.rules.base import ClickbaitRule
 from domain.posts import CatalogPost
@@ -32,19 +32,24 @@ class RuleBasedClickbaitAnalyzer:
 
     def analyze(self, post: CatalogPost) -> ClickbaitAnalysis:
         if post.id is None:
-            raise ValueError("CatalogPost.id (local SQLite id) is required for analysis")
+            raise ValueError("CatalogPost.id is required for analysis")
 
         features = ClickbaitFeatures()
         reasons: list[str] = []
+        contributions: list[RuleContribution] = []
         total = 0.0
 
         for rule in self._rules:
             result = rule.check(post)
             if not result.matched:
                 continue
-            total += float(result.weight)
+            weight = float(result.weight)
+            total += weight
             if result.reason and result.reason not in reasons:
                 reasons.append(result.reason)
+            contributions.append(
+                RuleContribution(reason=result.reason or "rule", weight=weight)
+            )
             feature_name = result.feature or getattr(rule, "feature", None)
             if feature_name and hasattr(features, feature_name):
                 setattr(features, feature_name, True)
@@ -56,6 +61,7 @@ class RuleBasedClickbaitAnalyzer:
             is_clickbait=score >= self.threshold,
             reasons=reasons,
             features=features,
+            rule_contributions=contributions,
         )
 
 

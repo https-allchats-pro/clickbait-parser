@@ -10,3 +10,6 @@ data/*.sqlite3
 data/*.db
 dataset/*.csv
 !dataset/.gitkeep
+models/*
+!models/.gitkeep
+*.joblib
