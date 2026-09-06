@@ -23,6 +23,9 @@ class PipelineController(QObject):
         self._thread: QThread | None = None
         self._worker: PipelineWorker | None = None
         self._queued_request: PipelineRequest | None = None
+        self._inflight_request: PipelineRequest | None = None
+        self._inflight_append: bool = False
+        self._inflight_target_page: int | None = None
 
         window.run_requested.connect(self.start)
 
@@ -33,11 +36,22 @@ class PipelineController(QObject):
             return
 
         self._queued_request = None
-        # Soft busy for infinite-scroll / min-views fill so the feed stays usable.
+        self._inflight_request = request
+        # Stash flags up-front: thread.finished may clear inflight before the
+        # queued finished slot runs, which used to force append=False and reset
+        # the feed to page 1.
+        self._inflight_append = bool(request.append)
+        self._inflight_target_page = request.target_page
+        # Soft busy for page fetch / min-views fill so the feed stays usable.
         soft = (
-            bool(request.exclude_texts)
+            bool(request.append)
+            or bool(request.exclude_texts)
             or bool(getattr(self._window, "_pending_append", False))
+            or bool(getattr(request, "needs_filtered_fill", False))
             or int(getattr(request, "min_views", 0) or 0) > 0
+            or bool(getattr(request, "score_label", None))
+            or len(getattr(self._window, "_session_queries", []) or []) > 1
+            or bool(getattr(self._window, "_query_step_queue", None))
         )
         self._window.set_running(True, soft=soft)
         if not soft:
@@ -66,15 +80,26 @@ class PipelineController(QObject):
         self._window.apply_progress(progress)
 
     def _on_finished(self, result: PipelineResult) -> None:
-        self._window.show_result(result)
+        append = self._inflight_append
+        target_page = self._inflight_target_page
+        self._inflight_append = False
+        self._inflight_target_page = None
+        self._window.show_result(
+            result,
+            append=append,
+            target_page=target_page,
+        )
 
     def _on_error(self, exc: object) -> None:
+        self._inflight_append = False
+        self._inflight_target_page = None
         message = str(exc) if exc else "Unknown error"
         self._window.show_error(message)
 
     def _on_thread_finished(self) -> None:
         self._thread = None
         self._worker = None
+        self._inflight_request = None
         queued = self._queued_request
         self._queued_request = None
         if queued is not None:

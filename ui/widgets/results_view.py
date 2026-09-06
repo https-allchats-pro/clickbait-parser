@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 
-from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QDate, QLocale, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QButtonGroup,
+    QCalendarWidget,
     QComboBox,
+    QDateEdit,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -18,7 +21,6 @@ from PyQt6.QtWidgets import (
 
 from domain.dataset import DatasetLabel
 from domain.pipeline import AnalyzedPost
-from domain.posts import post_text_key
 from domain.scoring import (
     DEFAULT_SCORING_CONFIG,
     PostScoring,
@@ -28,6 +30,7 @@ from domain.scoring import (
 )
 from ui.theme import SP_4, SP_8, SP_12, SP_16
 from ui.widgets.circle_spinner import CircleSpinner
+from ui.widgets.pager_bar import PagerBar
 from ui.widgets.post_card import PostCard
 
 
@@ -39,14 +42,18 @@ class ResultFilter(str, Enum):
 
 
 class ResultSort(str, Enum):
-    DEFAULT = "default"
+    DATE_DESC = "date_desc"  # newest → oldest (VK newsfeed.search order)
     VIEWS_DESC = "views_desc"
     VIEWS_ASC = "views_asc"
     SCORE_DESC = "score_desc"
     SCORE_ASC = "score_asc"
 
 
-_NEAR_BOTTOM_PX = 240
+class TimePreset(str, Enum):
+    DAY = "day"
+    WEEK = "week"
+    MONTH = "month"
+    CUSTOM = "custom"
 
 
 class ResultsView(QWidget):
@@ -55,25 +62,34 @@ class ResultsView(QWidget):
     label_requested = pyqtSignal(int, object)  # post id, DatasetLabel
     filter_changed = pyqtSignal(object)  # ResultFilter
     scoring_mode_changed = pyqtSignal(object)  # ScoringMode
-    load_more_requested = pyqtSignal()
     run_requested = pyqtSignal()
     min_views_changed = pyqtSignal(int)
+    time_window_changed = pyqtSignal()  # VK start_time/end_time changed
+    prev_page_requested = pyqtSignal()
+    next_page_requested = pyqtSignal()
+    page_requested = pyqtSignal(int)  # 1-based
+    page_size_changed = pyqtSignal(int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._posts: list[AnalyzedPost] = []
         self._human_labels: dict[int, DatasetLabel] = {}
         self._filter = ResultFilter.ALL
-        self._sort = ResultSort.DEFAULT
+        self._sort = ResultSort.DATE_DESC
         self._min_views = 0
+        self._time_preset = TimePreset.DAY
+        self._custom_start: date | None = None
+        self._custom_end: date | None = None
         self._received_results = False
         self._scoring_mode = ScoringMode.RULES
         self._scoring_config = DEFAULT_SCORING_CONFIG
         self._ml_ready = False
-        self._load_more_enabled = False
         self._loading_more = False
-        self._near_bottom_emitted = False
         self._feed_exhausted = False
+        self._page = 1
+        self._has_more = False
+        self._pager_busy = False
+        self._page_loading = False  # True while fetching the next pager page
 
         self._empty_title = QLabel("Запустите анализ")
         self._empty_title.setObjectName("emptyTitle")
@@ -112,7 +128,7 @@ class ResultsView(QWidget):
         self._loading_label = QLabel("Загрузка постов…")
         self._loading_label.setObjectName("statusFooter")
         loading_row = QHBoxLayout()
-        loading_row.setContentsMargins(0, SP_8, 0, SP_16)
+        loading_row.setContentsMargins(0, SP_8, 0, SP_8)
         loading_row.setSpacing(SP_12)
         loading_row.addStretch(1)
         loading_row.addWidget(self._spinner, alignment=Qt.AlignmentFlag.AlignVCenter)
@@ -123,14 +139,17 @@ class ResultsView(QWidget):
         self._loading_footer.setLayout(loading_row)
         self._loading_footer.hide()
 
+        self._pager = PagerBar(default_size=20)
+        self._pager.prev_requested.connect(self.prev_page_requested.emit)
+        self._pager.next_requested.connect(self.next_page_requested.emit)
+        self._pager.page_requested.connect(self.page_requested.emit)
+        self._pager.page_size_changed.connect(self.page_size_changed.emit)
+        self._pager.hide()
+
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setWidget(self._cards_host)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._scroll.viewport().installEventFilter(self)
-        scrollbar = self._scroll.verticalScrollBar()
-        scrollbar.valueChanged.connect(self._on_scroll_changed)
-        scrollbar.rangeChanged.connect(self._on_scroll_range_changed)
 
         mode_label = QLabel("Score mode")
         mode_label.setObjectName("sectionLabel")
@@ -187,7 +206,7 @@ class ResultsView(QWidget):
         sort_label = QLabel("Сортировка")
         sort_label.setObjectName("sectionLabel")
         self._sort_combo = QComboBox()
-        self._sort_combo.addItem("По умолчанию", ResultSort.DEFAULT.value)
+        self._sort_combo.addItem("Сначала новые", ResultSort.DATE_DESC.value)
         self._sort_combo.addItem("Просмотры ↓", ResultSort.VIEWS_DESC.value)
         self._sort_combo.addItem("Просмотры ↑", ResultSort.VIEWS_ASC.value)
         self._sort_combo.addItem("Final % ↓", ResultSort.SCORE_DESC.value)
@@ -205,6 +224,41 @@ class ResultsView(QWidget):
         self._min_views_input.setToolTip("Показывать только посты с не меньшим числом просмотров")
         self._min_views_input.valueChanged.connect(self._on_min_views_changed)
 
+        period_label = QLabel("Период")
+        period_label.setObjectName("sectionLabel")
+        self._period_combo = QComboBox()
+        self._period_combo.addItem("За сутки", TimePreset.DAY.value)
+        self._period_combo.addItem("За неделю", TimePreset.WEEK.value)
+        self._period_combo.addItem("За месяц", TimePreset.MONTH.value)
+        self._period_combo.addItem("Свой период", TimePreset.CUSTOM.value)
+        self._period_combo.setToolTip(
+            "Окно newsfeed.search: start_time / end_time (по умолчанию — сутки)"
+        )
+        self._period_combo.currentIndexChanged.connect(self._on_period_changed)
+
+        self._custom_period_host = QWidget()
+        custom_row = QHBoxLayout(self._custom_period_host)
+        custom_row.setContentsMargins(0, 0, 0, 0)
+        custom_row.setSpacing(SP_8)
+        from_lbl = QLabel("с")
+        from_lbl.setObjectName("sectionLabel")
+        to_lbl = QLabel("по")
+        to_lbl.setObjectName("sectionLabel")
+        self._period_start_input = QDateEdit()
+        self._period_end_input = QDateEdit()
+        for edit in (self._period_start_input, self._period_end_input):
+            self._configure_russian_date_edit(edit)
+        today = QDate.currentDate()
+        self._period_start_input.setDate(today.addDays(-7))
+        self._period_end_input.setDate(today)
+        self._period_start_input.dateChanged.connect(self._on_custom_period_changed)
+        self._period_end_input.dateChanged.connect(self._on_custom_period_changed)
+        custom_row.addWidget(from_lbl)
+        custom_row.addWidget(self._period_start_input)
+        custom_row.addWidget(to_lbl)
+        custom_row.addWidget(self._period_end_input)
+        self._custom_period_host.hide()
+
         controls = QHBoxLayout()
         controls.setSpacing(SP_8)
         sort_col = QVBoxLayout()
@@ -215,8 +269,14 @@ class ResultsView(QWidget):
         min_col.setSpacing(SP_4)
         min_col.addWidget(min_label)
         min_col.addWidget(self._min_views_input)
+        period_col = QVBoxLayout()
+        period_col.setSpacing(SP_4)
+        period_col.addWidget(period_label)
+        period_col.addWidget(self._period_combo)
+        period_col.addWidget(self._custom_period_host)
         controls.addLayout(sort_col)
         controls.addLayout(min_col)
+        controls.addLayout(period_col)
         controls.addStretch(1)
 
         root = QVBoxLayout(self)
@@ -227,61 +287,112 @@ class ResultsView(QWidget):
         root.addLayout(controls)
         root.addWidget(self._empty_host, stretch=1)
         root.addWidget(self._scroll, stretch=1)
+        root.addWidget(self._pager)
         self._scroll.hide()
         self._sync_mode_buttons()
 
     def set_results(self, posts: list[AnalyzedPost]) -> None:
-        self._posts = self._unique_by_text(posts)
+        self._posts = self._unique_by_identity(posts)
         self._human_labels = {}
         self._received_results = True
-        self._near_bottom_emitted = False
+        self._page_loading = False
+        self._page = 1
         self._render()
+        self._scroll_to_top()
+
+    def extend_posts(self, posts: list[AnalyzedPost]) -> None:
+        """Append to the buffer without rendering (caller decides the page)."""
+        if not posts:
+            return
+        self._posts = self._unique_by_identity([*self._posts, *posts])
+        self._received_results = True
 
     def append_results(self, posts: list[AnalyzedPost]) -> None:
-        """Append a new page without rebuilding existing cards (keeps UI responsive)."""
-        if not posts:
-            self._near_bottom_emitted = False
-            return
+        """Extend the in-memory buffer and redraw the current page."""
+        self.extend_posts(posts)
+        self._render()
 
-        before_count = len(self._posts)
-        self._posts = self._unique_by_text([*self._posts, *posts])
-        self._received_results = True
-        self._near_bottom_emitted = False
-        added = self._posts[before_count:]
-        if not added:
-            return
+    def redraw(self) -> None:
+        self._render()
+        self._scroll_to_top()
 
-        # First page / empty / non-default sort → full render (order may change).
-        if (
-            not self._scroll.isVisible()
-            or self._sort != ResultSort.DEFAULT
-            or before_count == 0
-        ):
-            bar = self._scroll.verticalScrollBar()
-            old_value = bar.value()
+    def set_pagination(self, *, has_more: bool, busy: bool = False) -> None:
+        self._has_more = bool(has_more)
+        self._pager_busy = bool(busy)
+        self._sync_pager()
+
+    def page_size(self) -> int:
+        return self._pager.page_size()
+
+    def set_page_size(self, value: int, *, emit: bool = False) -> None:
+        self._pager.set_page_size(value, emit=emit)
+
+    def current_page(self) -> int:
+        return self._page
+
+    def page_count(self) -> int:
+        """Loaded pages, plus one provisional page while remote fetch may continue."""
+        loaded = self.loaded_page_count()
+        if loaded <= 0:
+            return 0
+        # Always expose a provisional next page while VK may have more —
+        # otherwise pages 1–3 look capped at 4 even when Next can go further.
+        if self._has_more and not self._feed_exhausted:
+            return loaded + 1
+        return loaded
+
+    def loaded_page_count(self) -> int:
+        size = max(1, self.page_size())
+        total_items = len(self.filtered_posts())
+        if total_items <= 0:
+            return 0
+        return max(1, (total_items + size - 1) // size)
+
+    def can_go_next_local(self) -> bool:
+        return self._page < self.loaded_page_count()
+
+    def go_to_page(self, page: int) -> None:
+        """Open a loaded page. Remote pages are requested by MainWindow."""
+        loaded = self.loaded_page_count()
+        target = max(1, int(page))
+        if loaded <= 0:
+            self._page = 1
+        else:
+            self._page = min(target, loaded)
+        self._render()
+        self._scroll_to_top()
+
+    def go_prev_page(self) -> None:
+        if self._page > 1:
+            self._page -= 1
             self._render()
-            bar.setValue(old_value)
-            return
+            self._scroll_to_top()
 
-        visible_added = [item for item in added if self._passes_current_filters(item)]
-        if visible_added:
-            self._empty_host.hide()
-            self._scroll.show()
-            self._header_run_button.show()
-            self._append_cards(visible_added)
-        self._check_near_bottom()
+    def go_next_page(self) -> None:
+        if self.can_go_next_local():
+            self._page += 1
+            self._render()
+            self._scroll_to_top()
 
-    def set_load_more_enabled(self, enabled: bool) -> None:
-        self._load_more_enabled = bool(enabled)
-        if not self._load_more_enabled:
-            self._near_bottom_emitted = False
-            return
-        # Content may already sit at the bottom (short filtered page).
-        QTimer.singleShot(0, self._check_near_bottom)
+    def set_loading_more(
+        self,
+        loading: bool,
+        *,
+        hint: str | None = None,
+        clear_page: bool = False,
+    ) -> None:
+        """Show/hide spinner while a page is loading.
 
-    def set_loading_more(self, loading: bool, *, hint: str | None = None) -> None:
-        """Show/hide circular spinner at the end of the list."""
+        ``clear_page=True`` replaces the current cards with a loading state
+        (used when advancing the pager to a not-yet-fetched page).
+        """
+        was_page_loading = self._page_loading
         self._loading_more = bool(loading)
+        if loading:
+            self._page_loading = bool(clear_page)
+        else:
+            self._page_loading = False
+
         if hint:
             self._loading_label.setText(hint)
         elif self._min_views > 0:
@@ -290,30 +401,61 @@ class ResultsView(QWidget):
             )
         else:
             self._loading_label.setText("Загрузка постов…")
+
         if self._loading_more:
-            self._ensure_loading_footer()
             self._empty_host.hide()
             self._scroll.show()
             self._header_run_button.show()
+            self._pager.show()
+            if self._page_loading:
+                self._clear_cards()
+                self._cards_layout.addStretch(1)
+                self._ensure_loading_footer()
+                loaded = self.loaded_page_count()
+                if loaded > 0:
+                    self._page = loaded + 1
+            else:
+                self._ensure_loading_footer()
             self._loading_footer.show()
             self._spinner.set_spinning(True)
-            # Keep the spinner in view while the next page loads.
-            bar = self._scroll.verticalScrollBar()
-            bar.setValue(bar.maximum())
-        else:
-            self._spinner.set_spinning(False)
-            self._loading_footer.hide()
-            self._near_bottom_emitted = False
-            self._loading_label.setText("Загрузка постов…")
-            # Short lists stay "at bottom" — re-check after the latch clears.
-            if self._load_more_enabled:
-                QTimer.singleShot(0, self._check_near_bottom)
+            self._scroll_to_top()
+            self._sync_pager()
+            return
 
-    def reset_near_bottom_gate(self) -> None:
-        self._near_bottom_emitted = False
+        self._spinner.set_spinning(False)
+        self._loading_footer.hide()
+        self._loading_label.setText("Загрузка постов…")
+        # Do not render here — MainWindow chooses the target page after fetch.
+        if was_page_loading:
+            self._sync_pager()
+            return
+        self._sync_pager()
+
+    def _scroll_to_top(self) -> None:
+        bar = self._scroll.verticalScrollBar()
+        bar.setValue(0)
 
     def set_feed_exhausted(self, exhausted: bool) -> None:
         self._feed_exhausted = bool(exhausted)
+        if exhausted:
+            self._has_more = False
+        self._sync_pager()
+
+    def _sync_pager(self) -> None:
+        loaded = self.loaded_page_count()
+        if not self._page_loading and loaded > 0 and self._page > loaded:
+            self._page = loaded
+        busy = self._pager_busy or self._loading_more
+        has_more = self._has_more and not self._feed_exhausted
+        total = self.page_count()
+        if self._page_loading and loaded > 0:
+            total = max(total, self._page)
+        self._pager.set_pagination(
+            current=max(1, self._page),
+            total=total,
+            has_more=has_more,
+            busy=busy,
+        )
 
     def update_ml_scores(self, scores_by_post_id: dict[int, float | None]) -> None:
         """Refresh ML probabilities on already loaded posts (e.g. after train)."""
@@ -410,6 +552,7 @@ class ResultsView(QWidget):
 
     def set_filter(self, value: ResultFilter) -> None:
         self._filter = value
+        self._page = 1
         mapping = {
             ResultFilter.ALL: self._btn_all,
             ResultFilter.CLICKBAIT: self._btn_clickbait,
@@ -463,11 +606,38 @@ class ResultsView(QWidget):
         self._render()
         self.min_views_changed.emit(self._min_views)
 
+    def set_time_preset(self, value: TimePreset, *, emit: bool = False) -> None:
+        self._time_preset = value
+        index = self._period_combo.findData(value.value)
+        if index >= 0:
+            self._period_combo.blockSignals(True)
+            self._period_combo.setCurrentIndex(index)
+            self._period_combo.blockSignals(False)
+        self._custom_period_host.setVisible(value == TimePreset.CUSTOM)
+        if emit:
+            self.time_window_changed.emit()
+
+    def set_custom_period(self, start: date, end: date, *, emit: bool = False) -> None:
+        if end < start:
+            start, end = end, start
+        self._custom_start = start
+        self._custom_end = end
+        self._period_start_input.blockSignals(True)
+        self._period_end_input.blockSignals(True)
+        self._period_start_input.setDate(QDate(start.year, start.month, start.day))
+        self._period_end_input.setDate(QDate(end.year, end.month, end.day))
+        self._period_start_input.blockSignals(False)
+        self._period_end_input.blockSignals(False)
+        self.set_time_preset(TimePreset.CUSTOM, emit=emit)
+
     def current_filter(self) -> ResultFilter:
         return self._filter
 
     def current_scoring_mode(self) -> ScoringMode:
         return self._scoring_mode
+
+    def current_scoring_config(self) -> ScoringConfig:
+        return self._scoring_config
 
     def current_sort(self) -> ResultSort:
         return self._sort
@@ -475,15 +645,47 @@ class ResultsView(QWidget):
     def current_min_views(self) -> int:
         return self._min_views
 
+    def current_time_preset(self) -> TimePreset:
+        return self._time_preset
+
+    def current_time_window(self) -> tuple[int, int]:
+        """Unix ``(start_time, end_time)`` for newsfeed.search."""
+        now = datetime.now().astimezone()
+        end = now
+        if self._time_preset == TimePreset.DAY:
+            start = now - timedelta(days=1)
+        elif self._time_preset == TimePreset.WEEK:
+            start = now - timedelta(days=7)
+        elif self._time_preset == TimePreset.MONTH:
+            start = now - timedelta(days=30)
+        else:
+            start_day = self._custom_start or (now.date() - timedelta(days=7))
+            end_day = self._custom_end or now.date()
+            if end_day < start_day:
+                start_day, end_day = end_day, start_day
+            start = datetime(
+                start_day.year, start_day.month, start_day.day, 0, 0, 0
+            ).astimezone()
+            end = datetime(
+                end_day.year, end_day.month, end_day.day, 23, 59, 59
+            ).astimezone()
+        return int(start.timestamp()), int(end.timestamp())
+
     @property
     def posts(self) -> list[AnalyzedPost]:
         """Deduped posts currently held by the view (before filter/sort)."""
         return list(self._posts)
 
-    def visible_posts(self) -> list[AnalyzedPost]:
+    def filtered_posts(self) -> list[AnalyzedPost]:
+        """All posts matching the current filter/sort (full buffer)."""
         posts = [p for p in self._posts if self._passes_current_filters(p)]
 
-        if self._sort == ResultSort.VIEWS_DESC:
+        if self._sort == ResultSort.DATE_DESC:
+            posts.sort(
+                key=lambda p: p.post.date or datetime.min.replace(tzinfo=timezone.utc),
+                reverse=True,
+            )
+        elif self._sort == ResultSort.VIEWS_DESC:
             posts.sort(key=lambda p: int(p.post.views or 0), reverse=True)
         elif self._sort == ResultSort.VIEWS_ASC:
             posts.sort(key=lambda p: int(p.post.views or 0))
@@ -492,6 +694,13 @@ class ResultsView(QWidget):
         elif self._sort == ResultSort.SCORE_ASC:
             posts.sort(key=lambda p: float(self.scoring_for(p).final_score))
         return posts
+
+    def visible_posts(self) -> list[AnalyzedPost]:
+        """Posts shown on the current page (after filter/sort)."""
+        pool = self.filtered_posts()
+        size = max(1, self.page_size())
+        start = (max(1, self._page) - 1) * size
+        return pool[start : start + size]
 
     def _passes_current_filters(self, item: AnalyzedPost) -> bool:
         if self._filter == ResultFilter.CLICKBAIT:
@@ -508,16 +717,22 @@ class ResultsView(QWidget):
         return True
 
     @staticmethod
-    def _unique_by_text(posts: list[AnalyzedPost]) -> list[AnalyzedPost]:
-        """Keep first post for each normalized text body."""
+    def _unique_by_identity(posts: list[AnalyzedPost]) -> list[AnalyzedPost]:
+        """Keep first occurrence of each VK post id; same text from different posts is OK."""
         unique: list[AnalyzedPost] = []
-        seen_texts: set[str] = set()
+        seen_ids: set[tuple[str, int, int]] = set()
+        seen_local: set[int] = set()
         for item in posts:
-            key = post_text_key(item.post.text)
-            if key:
-                if key in seen_texts:
+            post = item.post
+            key = (post.source, int(post.owner_id), int(post.post_id))
+            if key in seen_ids:
+                continue
+            seen_ids.add(key)
+            if post.id is not None:
+                local = int(post.id)
+                if local in seen_local:
                     continue
-                seen_texts.add(key)
+                seen_local.add(local)
             unique.append(item)
         return unique
 
@@ -561,6 +776,7 @@ class ResultsView(QWidget):
             3: ResultFilter.LABELED,
         }
         self._filter = mapping.get(button_id, ResultFilter.ALL)
+        self._page = 1
         self.filter_changed.emit(self._filter)
         self._render()
 
@@ -569,13 +785,62 @@ class ResultsView(QWidget):
         try:
             self._sort = ResultSort(str(raw))
         except ValueError:
-            self._sort = ResultSort.DEFAULT
+            self._sort = ResultSort.DATE_DESC
+        self._page = 1
         self._render()
 
     def _on_min_views_changed(self, value: int) -> None:
         self._min_views = max(0, int(value))
+        self._page = 1
         self._render()
         self.min_views_changed.emit(self._min_views)
+
+    @staticmethod
+    def _configure_russian_date_edit(edit: QDateEdit) -> None:
+        locale = QLocale(QLocale.Language.Russian, QLocale.Country.Russia)
+        edit.setLocale(locale)
+        edit.setCalendarPopup(True)
+        edit.setDisplayFormat("dd.MM.yyyy")
+        edit.setMinimumDate(QDate(2006, 1, 1))
+        edit.setMaximumDate(QDate.currentDate().addDays(1))
+        edit.setFixedWidth(130)
+        calendar = edit.calendarWidget()
+        if calendar is not None:
+            calendar.setLocale(locale)
+            calendar.setFirstDayOfWeek(Qt.DayOfWeek.Monday)
+            calendar.setNavigationBarVisible(True)
+            calendar.setHorizontalHeaderFormat(
+                QCalendarWidget.HorizontalHeaderFormat.ShortDayNames
+            )
+            calendar.setVerticalHeaderFormat(
+                QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader
+            )
+            calendar.setGridVisible(True)
+
+    def _on_period_changed(self, _index: int) -> None:
+        raw = self._period_combo.currentData()
+        try:
+            self._time_preset = TimePreset(str(raw))
+        except ValueError:
+            self._time_preset = TimePreset.DAY
+        self._custom_period_host.setVisible(self._time_preset == TimePreset.CUSTOM)
+        if self._time_preset == TimePreset.CUSTOM:
+            start_q = self._period_start_input.date()
+            end_q = self._period_end_input.date()
+            self._custom_start = date(start_q.year(), start_q.month(), start_q.day())
+            self._custom_end = date(end_q.year(), end_q.month(), end_q.day())
+        self.time_window_changed.emit()
+
+    def _on_custom_period_changed(self, _qdate: QDate) -> None:
+        if self._time_preset != TimePreset.CUSTOM:
+            return
+        start_q = self._period_start_input.date()
+        end_q = self._period_end_input.date()
+        if not start_q.isValid() or not end_q.isValid():
+            return
+        self._custom_start = date(start_q.year(), start_q.month(), start_q.day())
+        self._custom_end = date(end_q.year(), end_q.month(), end_q.day())
+        self.time_window_changed.emit()
 
     def _clear_cards(self) -> None:
         footer_index = self._cards_layout.indexOf(self._loading_footer)
@@ -597,23 +862,6 @@ class ResultsView(QWidget):
                     stretch_index = index
                     break
             self._cards_layout.insertWidget(stretch_index, self._loading_footer)
-
-    def _append_cards(self, items: list[AnalyzedPost]) -> None:
-        """Insert new cards before the loading footer / trailing stretch."""
-        self._ensure_loading_footer()
-        insert_at = self._cards_layout.indexOf(self._loading_footer)
-        if insert_at < 0:
-            insert_at = self._cards_layout.count()
-            for index in range(self._cards_layout.count()):
-                item = self._cards_layout.itemAt(index)
-                if item is not None and item.spacerItem() is not None:
-                    insert_at = index
-                    break
-
-        for item in items:
-            card = self._make_post_card(item)
-            self._cards_layout.insertWidget(insert_at, card)
-            insert_at += 1
 
     def _make_post_card(self, item: AnalyzedPost) -> PostCard:
         card = PostCard()
@@ -651,11 +899,19 @@ class ResultsView(QWidget):
         self._empty_host.show()
         self._scroll.hide()
         self.set_loading_more(False)
+        self._sync_pager()
 
     def _render(self) -> None:
         keep_loading = self._loading_more
+        page_loading = self._page_loading
         self._clear_cards()
-        visible = self.visible_posts()
+        pool = self.filtered_posts()
+        size = max(1, self.page_size())
+        if pool and self._page > 1 and not page_loading:
+            max_page = max(1, (len(pool) + size - 1) // size)
+            if self._page > max_page:
+                self._page = max_page
+        page_items = [] if page_loading else self.visible_posts()
 
         if not self._received_results:
             self._show_empty("", "", show_run=True)
@@ -676,9 +932,26 @@ class ResultsView(QWidget):
             self._cards_layout.addStretch(1)
             return
 
-        if not visible:
-            # Keep fetching until min-views is satisfied (or the feed is exhausted).
-            if self._posts and self._min_views > 0 and not self._feed_exhausted:
+        if page_loading:
+            self._empty_host.hide()
+            self._scroll.show()
+            self._header_run_button.show()
+            self._cards_layout.addStretch(1)
+            self._ensure_loading_footer()
+            self._loading_footer.show()
+            self._spinner.set_spinning(True)
+            self._sync_pager()
+            self._scroll_to_top()
+            return
+
+        if not pool:
+            if self._posts and (
+                (
+                    self._min_views > 0
+                    or self._filter in {ResultFilter.CLICKBAIT, ResultFilter.NORMAL}
+                )
+                and not self._feed_exhausted
+            ):
                 self._empty_host.hide()
                 self._scroll.show()
                 self._header_run_button.show()
@@ -686,11 +959,15 @@ class ResultsView(QWidget):
                 self._ensure_loading_footer()
                 self._loading_footer.show()
                 self._spinner.set_spinning(True)
-                self._loading_label.setText(
-                    f"Ищем посты с ≥{self._min_views} просмотрами…"
-                )
-                # MainWindow owns autofill on min-views change — don't emit load-more
-                # from here (it races with exhausted/pending flags).
+                if self._min_views > 0:
+                    self._loading_label.setText(
+                        f"Ищем посты с ≥{self._min_views} просмотрами…"
+                    )
+                elif self._filter == ResultFilter.CLICKBAIT:
+                    self._loading_label.setText("Ищем clickbait-посты…")
+                else:
+                    self._loading_label.setText("Ищем обычные посты…")
+                self._sync_pager()
                 return
             if self._filter == ResultFilter.LABELED:
                 self._show_empty(
@@ -708,7 +985,7 @@ class ResultsView(QWidget):
         self._empty_host.hide()
         self._scroll.show()
         self._header_run_button.show()
-        for item in visible:
+        for item in page_items:
             self._cards_layout.addWidget(self._make_post_card(item))
 
         self._cards_layout.addStretch(1)
@@ -719,46 +996,4 @@ class ResultsView(QWidget):
         else:
             self._loading_footer.hide()
             self._spinner.set_spinning(False)
-
-        self._check_near_bottom()
-
-    def eventFilter(self, obj, event) -> bool:  # noqa: N802
-        if obj is self._scroll.viewport() and event.type() in {
-            QEvent.Type.Wheel,
-            QEvent.Type.Scroll,
-        }:
-            QTimer.singleShot(0, self._check_near_bottom)
-        return super().eventFilter(obj, event)
-
-    def _on_scroll_changed(self, _value: int = 0) -> None:
-        if not self._is_near_bottom():
-            # Allow another request once the user leaves the bottom zone.
-            self._near_bottom_emitted = False
-        self._check_near_bottom()
-
-    def _on_scroll_range_changed(self, *_args) -> None:
-        # New content / filter changes often keep the viewport at the bottom.
-        self._near_bottom_emitted = False
-        self._check_near_bottom()
-
-    def _is_near_bottom(self) -> bool:
-        bar = self._scroll.verticalScrollBar()
-        maximum = bar.maximum()
-        if maximum <= 0:
-            return True
-        return (maximum - bar.value()) <= _NEAR_BOTTOM_PX
-
-    def _check_near_bottom(self) -> None:
-        if not self._load_more_enabled or self._loading_more:
-            return
-        if not self._posts:
-            return
-        if not self._is_near_bottom():
-            self._near_bottom_emitted = False
-            return
-        if self._near_bottom_emitted:
-            return
-        # Latch before emit so sticky short lists don't flood requests.
-        self._near_bottom_emitted = True
-        self._load_more_enabled = False
-        self.load_more_requested.emit()
+        self._sync_pager()

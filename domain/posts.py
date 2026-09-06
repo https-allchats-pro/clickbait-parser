@@ -26,6 +26,12 @@ class CatalogPost:
     links: list[PostLink] = field(default_factory=list)
     id: int | None = None  # local SQLite row id when loaded
 
+    def wall_url(self) -> str | None:
+        """Public permalink for the post, when the source supports one."""
+        if self.source.startswith("vk"):
+            return f"https://vk.com/wall{int(self.owner_id)}_{int(self.post_id)}"
+        return None
+
 
 SOURCE_VK_CATALOG = "vk_catalog"
 

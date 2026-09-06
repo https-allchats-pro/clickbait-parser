@@ -184,7 +184,9 @@ class CatalogServiceTests(unittest.TestCase):
 
         service = CatalogService(client=client, posts=posts_repo)
         result = service.collect(count=100)
-        client.get_search_top.assert_called_once_with(count=50, start_from=None, query=None)
+        client.get_search_top.assert_called_once_with(
+            count=50, start_from=None, query=None, start_time=None, end_time=None
+        )
         posts_repo.upsert_many.assert_called_once_with(page_posts)
         self.assertEqual(result.fetched, 1)
         self.assertEqual(result.upsert.inserted, 1)
@@ -198,7 +200,15 @@ class CatalogServiceTests(unittest.TestCase):
             type("R", (), {"inserted": 1, "updated": 0, "unchanged": 0})(),
         ]
 
-        def _page(*, count: int, start_from: str | None = None, query: str | None = None) -> CatalogPage:
+        def _page(
+            *,
+            count: int,
+            start_from: str | None = None,
+            query: str | None = None,
+            start_time: int | None = None,
+            end_time: int | None = None,
+        ) -> CatalogPage:
+            _ = (start_time, end_time)
             if start_from is None:
                 return CatalogPage(
                     posts=[
@@ -318,20 +328,66 @@ class CatalogServiceTests(unittest.TestCase):
             id=1,
         )
         client.get_search_top.side_effect = [
-            CatalogPage(posts=[dup], next_from=f"n{i}") for i in range(1, 10)
+            CatalogPage(posts=[dup], next_from=f"n{i}")
+            for i in range(1, CatalogService.STAGNANT_HARD_CAP + 5)
         ]
         posts_repo.get.return_value = dup
         service = CatalogService(client=client, posts=posts_repo)
         result = service.collect(count=50, pages=20)
         self.assertEqual(result.fetched, 1)
-        # first page yields 1, next five are stagnant → stop
-        self.assertEqual(client.get_search_top.call_count, 6)
+        # first page yields 1, then duplicate-only pages until STAGNANT_HARD_CAP
+        self.assertEqual(
+            client.get_search_top.call_count,
+            1 + CatalogService.STAGNANT_HARD_CAP,
+        )
+        # Cursor must survive so the GUI can keep paginating.
+        self.assertIsNotNone(result.next_from)
 
-    def test_collect_skips_duplicate_texts(self) -> None:
+    def test_collect_keeps_cursor_on_empty_mapped_page(self) -> None:
         client = MagicMock()
         posts_repo = MagicMock()
         posts_repo.upsert_many.return_value = type(
-            "R", (), {"inserted": 2, "updated": 0, "unchanged": 0}
+            "R", (), {"inserted": 1, "updated": 0, "unchanged": 0}
+        )()
+
+        good = CatalogPost(
+            source=SOURCE_VK_CATALOG,
+            owner_id=-1,
+            post_id=7,
+            text="ok",
+            date=datetime.fromtimestamp(1, tz=UTC),
+            id=7,
+        )
+
+        def _page(
+            *,
+            count: int,
+            start_from: str | None = None,
+            query: str | None = None,
+            start_time: int | None = None,
+            end_time: int | None = None,
+        ) -> CatalogPage:
+            _ = (count, query, start_time, end_time)
+            if start_from is None:
+                return CatalogPage(posts=[], next_from="n1")
+            return CatalogPage(posts=[good], next_from="n2")
+
+        def _get(source: str, owner_id: int, post_id: int) -> CatalogPost:
+            return good
+
+        client.get_search_top.side_effect = _page
+        posts_repo.get.side_effect = _get
+        service = CatalogService(client=client, posts=posts_repo)
+        result = service.collect(count=1, pages=5)
+        self.assertEqual(result.fetched, 1)
+        self.assertEqual(result.next_from, "n2")
+        self.assertEqual(client.get_search_top.call_count, 2)
+
+    def test_collect_keeps_same_text_from_different_posts(self) -> None:
+        client = MagicMock()
+        posts_repo = MagicMock()
+        posts_repo.upsert_many.return_value = type(
+            "R", (), {"inserted": 3, "updated": 0, "unchanged": 0}
         )()
         a = CatalogPost(
             source=SOURCE_VK_CATALOG,
@@ -365,8 +421,8 @@ class CatalogServiceTests(unittest.TestCase):
         posts_repo.get.side_effect = _get
         service = CatalogService(client=client, posts=posts_repo)
         result = service.collect(count=10)
-        self.assertEqual(result.fetched, 2)
-        self.assertEqual([p.post_id for p in result.posts], [1, 3])
+        self.assertEqual(result.fetched, 3)
+        self.assertEqual([p.post_id for p in result.posts], [1, 2, 3])
 
     def test_collect_preserves_next_from_when_target_reached(self) -> None:
         client = MagicMock()
@@ -428,13 +484,13 @@ class CatalogServiceTests(unittest.TestCase):
         result = service.collect(
             count=10,
             start_from="n1",
-            exclude_texts={"уже видели"},
+            exclude_texts={"уже видели"},  # ignored: text dedupe removed
         )
-        self.assertEqual(result.fetched, 1)
-        self.assertEqual(result.posts[0].post_id, 2)
+        self.assertEqual(result.fetched, 2)
+        self.assertEqual([p.post_id for p in result.posts], [1, 2])
         self.assertIsNone(result.next_from)
         client.get_search_top.assert_called_once_with(
-            count=50, start_from="n1", query=None
+            count=50, start_from="n1", query=None, start_time=None, end_time=None
         )
 
     def test_collect_without_persist_uses_ephemeral_ids(self) -> None:

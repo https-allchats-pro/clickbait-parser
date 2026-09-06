@@ -6,7 +6,6 @@ from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -18,16 +17,16 @@ from PyQt6.QtWidgets import (
 from app.ml.feature_insights import ModelInsightsService
 from domain.ml import ModelInfo
 from domain.pipeline import PipelineProgress, PipelineRequest, PipelineResult
-from domain.posts import post_text_key
 from domain.dataset import DatasetLabel
 from domain.scoring import DEFAULT_SCORING_CONFIG
 from ui.theme import SP_4, SP_8, SP_12, SP_16, SP_24, get_current_theme, toggle_theme
 from ui.widgets.ml_panel import MLModelPanel
 from ui.widgets.model_insights_view import ModelInsightsView
 from ui.widgets.results_view import ResultFilter, ResultsView
+from ui.widgets.search_terms import SearchTermsBar
 
-# Fixed page size for analysis + infinite scroll load-more.
-PAGE_SIZE = 20
+# Default page size; UI spinbox can change it at runtime.
+DEFAULT_PAGE_SIZE = 20
 
 
 class MainWindow(QMainWindow):
@@ -42,8 +41,8 @@ class MainWindow(QMainWindow):
         self.resize(980, 760)
         self.setMinimumSize(900, 650)
 
-        self._query_input = QLineEdit()
-        self._query_input.setPlaceholderText("искать продолжение, новости…")
+        self._search = SearchTermsBar()
+        self._query_input = self._search.input
 
         self._stats_label = QLabel("0 posts · 0 clickbait · 0 normal")
         self._stats_label.setObjectName("statusFooter")
@@ -62,9 +61,6 @@ class MainWindow(QMainWindow):
             lambda _event: self._show_labeled_library()
         )
 
-        search_label = QLabel("Search")
-        search_label.setObjectName("sectionLabel")
-
         stats_col = QVBoxLayout()
         stats_col.setSpacing(SP_4)
         stats_col.addWidget(self._stats_label)
@@ -72,11 +68,7 @@ class MainWindow(QMainWindow):
 
         search_row = QHBoxLayout()
         search_row.setSpacing(SP_12)
-        search_col = QVBoxLayout()
-        search_col.setSpacing(SP_4)
-        search_col.addWidget(search_label)
-        search_col.addWidget(self._query_input)
-        search_row.addLayout(search_col, stretch=1)
+        search_row.addWidget(self._search, stretch=1)
         search_row.addLayout(stats_col)
 
         form = QVBoxLayout()
@@ -165,25 +157,43 @@ class MainWindow(QMainWindow):
         self._dataset: object | None = None
         self._ml: object | None = None
         self._next_from: str | None = None
-        self._seen_texts: set[str] = set()
+        # Frozen VK time window for the current Analyse session (must stay fixed
+        # across start_from pages — drifting end_time breaks the cursor).
+        self._session_start_time: int | None = None
+        self._session_end_time: int | None = None
+        # When VK omits next_from on a wide window, continue by sliding end_time.
+        self._time_end_cursor: int | None = None
+        self._pending_period_restart: bool = False
         self._page_offset: int = 0
         self._pending_append: bool = False
         self._session_query: str | None = None
+        self._session_queries: list[str] = []
+        self._query_cursors: dict[str, str | None] = {}
+        self._query_step_queue: list[str] = []
+        self._active_query: str | None = None
         self._running: bool = False
         self._feed_exhausted: bool = False
         self._last_append_added: int = 0
         self._empty_scan_rounds: int = 0
+        self._empty_page_retries: int = 0
         self._analysis_posts: list = []
         self._analysis_labels: dict[int, DatasetLabel] = {}
         self._showing_labeled_library: bool = False
-        self._sync_load_more()
+        self._advance_after_fetch: bool = False
+        self._pending_target_page: int | None = None
+        self._sync_pager()
         self._results.label_requested.connect(self._on_label_requested)
         self._results.filter_changed.connect(self._on_filter_changed)
         self._results.scoring_mode_changed.connect(self._on_scoring_mode_changed)
-        self._results.load_more_requested.connect(self._on_load_more_requested)
+        self._results.prev_page_requested.connect(self._on_prev_page_requested)
+        self._results.next_page_requested.connect(self._on_next_page_requested)
+        self._results.page_requested.connect(self._on_page_requested)
+        self._results.page_size_changed.connect(self._on_page_size_changed)
         self._results.run_requested.connect(self._on_run_clicked)
         self._results.min_views_changed.connect(self._on_min_views_changed)
+        self._results.time_window_changed.connect(self._on_time_window_changed)
         self._results.set_scoring_config(DEFAULT_SCORING_CONFIG)
+        self._results.set_page_size(DEFAULT_PAGE_SIZE)
 
     @property
     def _run_button(self) -> QPushButton:
@@ -331,58 +341,127 @@ class MainWindow(QMainWindow):
 
     @property
     def next_page_enabled(self) -> bool:
-        """True when infinite scroll may request another page."""
-        return self._can_load_more()
+        """True when Next can advance locally or fetch another VK page."""
+        return self._results.can_go_next_local() or self._can_fetch_more()
+
+    def _page_limit(self) -> int:
+        return max(1, self._results.page_size())
 
     def build_request(
         self,
         *,
         start_from: str | None = None,
         exclude_texts: frozenset[str] | None = None,
+        query: str | None = None,
+        limit: int | None = None,
+        target_page: int | None = None,
+        append: bool = False,
+        end_time: int | None = None,
     ) -> PipelineRequest:
-        query = self._query_input.text().strip() or None
+        score_label = self._score_label_for_filter()
+        config = self._results.current_scoring_config()
+        start_time = self._session_start_time
+        resolved_end = end_time if end_time is not None else self._session_end_time
+        if start_time is None or resolved_end is None:
+            start_time, resolved_end = self._results.current_time_window()
         return PipelineRequest(
-            limit=PAGE_SIZE,
+            limit=max(1, int(limit) if limit is not None else self._page_limit()),
             query=query,
             start_from=start_from,
             exclude_texts=exclude_texts or frozenset(),
             min_views=self._results.current_min_views(),
+            start_time=start_time,
+            end_time=resolved_end,
+            score_label=score_label,
+            scoring_mode=self._results.current_scoring_mode().value,
+            scoring_threshold=float(config.threshold),
+            scoring_rules_weight=float(config.rules_weight),
+            scoring_ml_weight=float(config.ml_weight),
+            append=append,
+            target_page=target_page,
         )
+
+    def _score_label_for_filter(self) -> str | None:
+        filt = self._results.current_filter()
+        if filt == ResultFilter.CLICKBAIT:
+            return "clickbait"
+        if filt == ResultFilter.NORMAL:
+            return "normal"
+        return None
+
+    def _matching_posts_needed(self, *, target_page: int | None = None) -> int:
+        """How many filter-matching posts the next fetch should collect."""
+        page_size = self._page_limit()
+        filtered = len(self._results.filtered_posts())
+        if target_page is not None:
+            needed_total = max(1, int(target_page)) * page_size
+            return max(1, needed_total - filtered)
+        return max(1, page_size - filtered)
+
+    def _filter_loading_hint(self) -> str:
+        score_label = self._score_label_for_filter()
+        min_views = self._results.current_min_views()
+        if score_label == "clickbait" and min_views > 0:
+            return f"Ищем clickbait с ≥{min_views} просмотрами…"
+        if score_label == "normal" and min_views > 0:
+            return f"Ищем обычные посты с ≥{min_views} просмотрами…"
+        if score_label == "clickbait":
+            return "Ищем clickbait-посты…"
+        if score_label == "normal":
+            return "Ищем обычные посты…"
+        if min_views > 0:
+            return f"Ищем посты с ≥{min_views} просмотрами…"
+        return "Загрузка постов…"
 
     def set_running(self, running: bool, *, soft: bool = False) -> None:
         """Mark pipeline busy.
 
-        ``soft=True`` is used for infinite-scroll / min-views fill: keep the feed
-        interactive and only gate new Analyse / load-more requests.
+        ``soft=True`` is used for page fetch / multi-query steps / min-views
+        fill: keep the feed interactive and only gate new Analyse requests.
         """
         self._running = bool(running)
         self._retry_button.setEnabled(not running)
         if not running:
             self._query_input.setEnabled(True)
             self._results.set_run_busy(False, text="Анализ")
-            # Keep the searching spinner visible while min-views autofill continues.
+            if self._pending_period_restart:
+                self._pending_period_restart = False
+                self._sync_pager()
+                QTimer.singleShot(0, self._on_run_clicked)
+                return
+            # More search words in this round → chain the next async step.
+            if self._query_step_queue:
+                nxt = self._query_step_queue[0]
+                self._results.set_loading_more(True, hint=f"Поиск: «{nxt}»…")
+                self._sync_pager()
+                QTimer.singleShot(0, self._continue_query_steps)
+                return
             keep_searching = self._should_autofill_min_views()
             if keep_searching:
-                min_views = self._results.current_min_views()
                 self._results.set_loading_more(
                     True,
-                    hint=f"Ищем посты с ≥{min_views} просмотрами…",
+                    hint=self._filter_loading_hint(),
                 )
             else:
                 self._results.set_loading_more(False)
-            self._sync_load_more()
+            self._sync_pager()
             delay_ms = self._autofill_delay_ms()
             QTimer.singleShot(delay_ms, self._maybe_autofill_min_views)
             return
 
         if soft:
             self._query_input.setEnabled(True)
-            min_views = self._results.current_min_views()
-            if min_views > 0:
+            if self._active_query:
                 self._results.set_run_busy(True, text="Поиск...")
                 self._results.set_loading_more(
                     True,
-                    hint=f"Ищем посты с ≥{min_views} просмотрами…",
+                    hint=f"Поиск: «{self._active_query}»…",
+                )
+            elif self._has_narrowing_filter():
+                self._results.set_run_busy(True, text="Поиск...")
+                self._results.set_loading_more(
+                    True,
+                    hint=self._filter_loading_hint(),
                 )
             else:
                 self._results.set_run_busy(True, text="Подгрузка...")
@@ -390,23 +469,38 @@ class MainWindow(QMainWindow):
             self._query_input.setEnabled(False)
             self._results.set_run_busy(True, text="Анализируется...")
             self.clear_error()
-        self._sync_load_more()
+        self._sync_pager()
 
     def apply_progress(self, progress: PipelineProgress) -> None:
         """Progress UI removed — kept as a no-op for the pipeline controller."""
         _ = progress
 
-    def show_result(self, result: PipelineResult) -> None:
-        appending = self._pending_append
+    def show_result(
+        self,
+        result: PipelineResult,
+        *,
+        append: bool | None = None,
+        target_page: int | None = None,
+    ) -> None:
+        # Prefer explicit flags from the controller (tied to the in-flight request).
+        # Fall back to window flags for unit tests that call show_result directly.
+        # Also OR with _pending_append: a controller race used to pass append=False
+        # and replace the whole feed (pagination looked stuck on page 1).
+        pending = self._pending_append
+        appending = pending if append is None else (bool(append) or pending)
         self._pending_append = False
         self._showing_labeled_library = False
         added_count = 0
+        advance = self._advance_after_fetch
+        self._advance_after_fetch = False
+        if target_page is None:
+            target_page = self._pending_target_page
+        self._pending_target_page = None
+        before_loaded = self._results.loaded_page_count() if appending else 0
 
         if appending:
             before_count = len(self._results.posts)
-            # Keep spinner visible while cards are appended, then hide.
-            self._results.append_results(result.posts)
-            self._results.set_loading_more(False)
+            self._results.extend_posts(result.posts)
             posts = self._results.posts
             added = posts[before_count:]
             added_count = len(added)
@@ -414,7 +508,6 @@ class MainWindow(QMainWindow):
             self._load_labels_for_posts(added, merge=True)
             self._analysis_labels = dict(self._results._human_labels)
         else:
-            self._results.set_loading_more(False)
             self._results.set_feed_exhausted(False)
             self._feed_exhausted = False
             self._results.set_results(result.posts)
@@ -424,19 +517,31 @@ class MainWindow(QMainWindow):
             self._load_labels_for_posts(posts)
             self._analysis_labels = dict(self._results._human_labels)
 
+        self._results.set_loading_more(False)
+
         self._refresh_result_stats()
 
-        for item in self._results.posts:
-            key = post_text_key(item.post.text)
-            if key:
-                self._seen_texts.add(key)
-
         self._next_from = result.next_from
+        self._update_time_end_cursor(result)
         self._page_offset = len(self._results.posts)
+        if self._active_query is not None:
+            self._query_cursors[self._active_query] = result.next_from
+            self._session_query = self._active_query
+            self._active_query = None
+        elif result.query_cursors:
+            self._query_cursors.update(result.query_cursors)
 
-        # Exhaust only when VK has no further cursor — empty rounds with a
-        # cursor must keep searching (min-views can skip many pages).
-        if not self._next_from:
+        # Exhaust only when no VK cursor / time-watermark remains.
+        if self._session_queries:
+            has_more = any(self._query_cursors.get(q) for q in self._session_queries)
+            has_pending_steps = bool(self._query_step_queue)
+            if self._query_cursors and not has_more and not has_pending_steps:
+                self._feed_exhausted = True
+                self._results.set_feed_exhausted(True)
+            else:
+                self._feed_exhausted = False
+                self._results.set_feed_exhausted(False)
+        elif not self._next_from and self._time_end_cursor is None:
             self._feed_exhausted = True
             self._results.set_feed_exhausted(True)
         else:
@@ -444,29 +549,78 @@ class MainWindow(QMainWindow):
             self._results.set_feed_exhausted(False)
 
         self._last_append_added = added_count
-        if added_count == 0 and self._results.current_min_views() > 0:
+        if added_count == 0 and (
+            self._has_narrowing_filter() or appending
+        ):
             self._empty_scan_rounds += 1
         else:
             self._empty_scan_rounds = 0
-        self._sync_load_more()
+
+        want_advance = bool(advance or target_page is not None)
+        desired_page = int(target_page) if target_page is not None else (
+            before_loaded + 1 if want_advance else None
+        )
+        loaded = self._results.loaded_page_count()
+
+        # Need another VK scan if the target filtered page is still short.
+        # With score_label fill the worker usually returns enough matches in one
+        # trip; this is a safety net when the feed is sparse / partially filled.
+        need_more_for_page = (
+            appending
+            and want_advance
+            and desired_page is not None
+            and loaded < desired_page
+            and self._has_remote_more()
+        )
+        if need_more_for_page:
+            self._empty_page_retries += 1
+            self._pending_target_page = desired_page
+            self._advance_after_fetch = True
+            self._results.set_loading_more(
+                True,
+                hint=self._filter_loading_hint(),
+                clear_page=True,
+            )
+            self._sync_pager()
+            self.clear_error()
+            self._schedule_fetch_more(clear_page=True)
+            return
+
+        if added_count > 0 and not need_more_for_page:
+            self._empty_page_retries = 0
+
+        if appending and want_advance:
+            if loaded <= 0:
+                self._results.redraw()
+            else:
+                page = desired_page if desired_page is not None else loaded
+                self._results.go_to_page(min(max(1, page), loaded))
+        elif not appending:
+            pass  # set_results already rendered page 1
+        else:
+            self._results.redraw()
+
+        self._sync_pager()
         self.clear_error()
 
     def show_error(self, message: str) -> None:
         self._pending_append = False
+        self._advance_after_fetch = False
+        self._pending_target_page = None
         self._results.set_loading_more(False)
         self._error_detail.setText(message or "Unknown error")
         self._error_panel.show()
-        self._sync_load_more()
+        self._sync_pager()
 
     def clear_error(self) -> None:
         self._error_panel.hide()
         self._error_detail.clear()
 
     def _refresh_result_stats(self) -> None:
-        # With min-views, stats follow what the user actually sees.
+        # With client filters, stats follow the filtered buffer (not only the page).
         posts = (
-            self._results.visible_posts()
-            if self._results.current_min_views() > 0
+            self._results.filtered_posts()
+            if self._has_narrowing_filter()
             else self._results.posts
         )
         clickbait = sum(
@@ -479,18 +633,34 @@ class MainWindow(QMainWindow):
         self._refresh_result_stats()
         self._maybe_autofill_min_views()
 
-    def _on_min_views_changed(self, value: int) -> None:
+    def _on_min_views_changed(self, _value: int) -> None:
         self._refresh_result_stats()
+        self._reopen_feed_for_filters()
+
+    def _on_time_window_changed(self) -> None:
+        # Period is a VK-side filter — restart search with new start_time/end_time.
+        if self._running:
+            self._pending_period_restart = True
+            return
+        if (
+            self._analysis_posts
+            or self._session_queries
+            or self._session_query is not None
+            or bool(self._current_search_terms())
+        ):
+            self._on_run_clicked()
+
+    def _reopen_feed_for_filters(self) -> None:
         # A previous "exhausted" flag was for another threshold / empty page.
         # If VK still has a cursor, reopen pagination and fill the visible page.
-        if self._next_from is not None:
+        has_cursor = bool(self._next_from) or any(self._query_cursors.values())
+        if has_cursor:
             self._feed_exhausted = False
             self._results.set_feed_exhausted(False)
-        self._results.reset_near_bottom_gate()
-        self._sync_load_more()
+        self._results.go_to_page(1)
+        self._sync_pager()
         if self._running:
             return
-        # Defer past ResultsView._render so load-more isn't racing the rebuild.
         QTimer.singleShot(0, self._maybe_autofill_min_views)
 
     def _set_stats(self, posts: int, clickbait: int, normal: int) -> None:
@@ -541,7 +711,9 @@ class MainWindow(QMainWindow):
             self._restore_analysis_results()
             # Keep the filter the user just chose (All / Clickbait / Normal).
             self._results.set_filter(value)
-        self._sync_load_more()
+        self._sync_pager()
+        # Clickbait / Normal may leave the first page short — keep filling.
+        self._reopen_feed_for_filters()
 
     def _show_labeled_library(self) -> None:
         service = self._dataset
@@ -565,7 +737,7 @@ class MainWindow(QMainWindow):
         self._refresh_ml_scores_on_posts()
         self._refresh_result_stats()
         self._refresh_label_stats()
-        self._sync_load_more()
+        self._sync_pager()
 
     def _restore_analysis_results(self) -> None:
         self._showing_labeled_library = False
@@ -573,7 +745,7 @@ class MainWindow(QMainWindow):
         self._results.set_human_labels(self._analysis_labels)
         self._refresh_result_stats()
         self._refresh_label_stats()
-        self._sync_load_more()
+        self._sync_pager()
 
     def _on_label_requested(self, post_id: int, label: object) -> None:
         service = self._dataset
@@ -631,122 +803,367 @@ class MainWindow(QMainWindow):
                 return item
         return None
 
+    def _has_remote_more(self) -> bool:
+        if self._feed_exhausted or self._showing_labeled_library or not self._analysis_posts:
+            return False
+        if self._session_queries:
+            return any(self._query_cursors.get(q) for q in self._session_queries)
+        return self._next_from is not None or self._time_end_cursor is not None
+
+    def _update_time_end_cursor(self, result: PipelineResult) -> None:
+        """When VK drops next_from, slide end_time to keep paging the window."""
+        if result.next_from:
+            self._time_end_cursor = None
+            return
+        if self._session_start_time is None:
+            self._time_end_cursor = None
+            return
+        if not result.posts:
+            self._time_end_cursor = None
+            return
+        oldest_ts: int | None = None
+        for item in result.posts:
+            post_date = item.post.date
+            if post_date is None:
+                continue
+            ts = int(post_date.timestamp())
+            if oldest_ts is None or ts < oldest_ts:
+                oldest_ts = ts
+        if oldest_ts is None:
+            self._time_end_cursor = None
+            return
+        candidate = oldest_ts - 1
+        # Watermark must move strictly older; otherwise we would loop forever.
+        if self._time_end_cursor is not None and candidate >= self._time_end_cursor:
+            self._time_end_cursor = None
+            return
+        if candidate > int(self._session_start_time):
+            self._time_end_cursor = candidate
+        else:
+            self._time_end_cursor = None
+
+    def _can_fetch_more(self) -> bool:
+        if self._running or self._pending_append or self._query_step_queue:
+            return False
+        return self._has_remote_more()
+
     def _can_load_more(self) -> bool:
+        """Backward-compatible alias used by tests."""
+        return self._can_fetch_more()
+
+    def _has_narrowing_filter(self) -> bool:
+        """True when the visible list is narrower than the raw VK buffer."""
+        filt = self._results.current_filter()
         return (
-            not self._running
-            and not self._pending_append
-            and not self._feed_exhausted
-            and not self._showing_labeled_library
-            and bool(self._analysis_posts)
-            and self._next_from is not None
+            filt in {ResultFilter.CLICKBAIT, ResultFilter.NORMAL}
+            or self._results.current_min_views() > 0
         )
 
     def _should_autofill_min_views(self) -> bool:
-        """Keep fetching until we have a full visible page under min-views."""
-        if self._results.current_min_views() <= 0:
+        """Keep fetching until the filtered buffer fills at least one page."""
+        if not self._has_narrowing_filter():
             return False
-        if not self._can_load_more():
+        if self._query_step_queue:
             return False
-        return len(self._results.visible_posts()) < PAGE_SIZE
+        if self._showing_labeled_library:
+            return False
+        if not self._can_fetch_more():
+            return False
+        return len(self._results.filtered_posts()) < self._page_limit()
 
     def _autofill_delay_ms(self) -> int:
-        """Pause before the next min-views scan; grows after empty rounds."""
-        if self._results.current_min_views() <= 0:
+        """Pause before the next filter fill scan; grows after empty rounds."""
+        if not self._has_narrowing_filter():
             return 0
         if not self._should_autofill_min_views():
             return 0
-        # Empty worker rounds (no new matching posts) → longer pause.
         base = 150
         extra = min(2_500, 350 * max(0, self._empty_scan_rounds))
         return base + extra
 
     def _maybe_autofill_min_views(self) -> None:
         if not self._should_autofill_min_views():
-            # Don't leave a stuck spinner that blocks scroll load-more.
-            if not self._running and not self._pending_append:
+            if not self._running and not self._pending_append and not self._query_step_queue:
                 self._results.set_loading_more(False)
-                self._sync_load_more()
+                self._sync_pager()
             return
-        self._on_load_more_requested()
+        self._fetch_more_page()
 
     def _min_views_fill_limit(self) -> int:
-        """How many matching posts we still need for a full visible page."""
-        visible = len(self._results.visible_posts())
-        return max(1, PAGE_SIZE - visible)
+        """How many matching posts we still need for a full page."""
+        filtered = len(self._results.filtered_posts())
+        return max(1, self._page_limit() - filtered)
 
-    def _sync_load_more(self) -> None:
-        self._results.set_load_more_enabled(self._can_load_more())
+    def _sync_pager(self) -> None:
+        self._results.set_pagination(
+            has_more=self._has_remote_more(),
+            busy=self._running or self._pending_append,
+        )
 
     def _reset_pagination(self) -> None:
         self._next_from = None
-        self._seen_texts = set()
+        self._session_start_time = None
+        self._session_end_time = None
+        self._time_end_cursor = None
         self._page_offset = 0
         self._pending_append = False
+        self._advance_after_fetch = False
+        self._pending_target_page = None
         self._session_query = None
+        self._session_queries = []
+        self._query_cursors = {}
+        self._query_step_queue = []
+        self._active_query = None
         self._feed_exhausted = False
         self._last_append_added = 0
         self._empty_scan_rounds = 0
+        self._empty_page_retries = 0
         self._results.set_feed_exhausted(False)
-        self._sync_load_more()
+        self._sync_pager()
 
     def _emit_request(self, request: PipelineRequest) -> None:
         self._session_query = request.query
         self.run_requested.emit(request)
 
+    def _current_search_terms(self) -> list[str]:
+        terms = self._search.terms()
+        if terms:
+            return terms
+        lone = self._query_input.text().strip()
+        return [lone] if lone else []
+
+    def _continue_query_steps(self) -> None:
+        if self._running or self._pending_append:
+            return
+        if not self._query_step_queue:
+            self._maybe_autofill_min_views()
+            return
+        self._start_next_query_step(append=True)
+
+    def _start_next_query_step(self, *, append: bool, clear_page: bool = False) -> None:
+        """Run one search word as its own async worker job."""
+        while self._query_step_queue:
+            query = self._query_step_queue[0]
+            if query in self._query_cursors and self._query_cursors[query] is None:
+                self._query_step_queue.pop(0)
+                continue
+            break
+        else:
+            self._sync_pager()
+            self._maybe_autofill_min_views()
+            return
+
+        query = self._query_step_queue.pop(0)
+        self._active_query = query
+        self._pending_append = append
+        start_from = self._query_cursors.get(query)
+        target = self._pending_target_page if clear_page else None
+        if self._has_narrowing_filter():
+            limit = self._matching_posts_needed(target_page=target)
+        else:
+            limit = self._page_limit()
+        request = self.build_request(
+            query=query,
+            start_from=start_from,
+            limit=limit,
+            append=append,
+            target_page=target,
+        )
+        self._results.set_loading_more(
+            True,
+            hint=f"Поиск: «{query}»…",
+            clear_page=clear_page,
+        )
+        self._sync_pager()
+        self._emit_request(request)
+
     def _on_run_clicked(self) -> None:
         try:
             self._analysis_posts = []
+            self._pending_period_restart = False
             self._reset_pagination()
+            self._session_start_time, self._session_end_time = (
+                self._results.current_time_window()
+            )
             self._pending_append = False
-            request = self.build_request()
+            self._search.commit_input()
+            terms = self._current_search_terms()
+            self._session_queries = list(terms)
+            self._query_cursors = {}
+            if terms:
+                self._query_step_queue = list(terms)
+                self._start_next_query_step(append=False)
+                return
+            request = self.build_request(query=None)
         except ValueError as exc:
             QMessageBox.warning(self, "Некорректный ввод", str(exc))
             return
-        self._results.set_load_more_enabled(False)
-        if request.min_views > 0:
+        self._sync_pager()
+        if request.needs_filtered_fill:
             self._results.set_loading_more(
                 True,
-                hint=f"Ищем посты с ≥{request.min_views} просмотрами…",
+                hint=self._filter_loading_hint(),
             )
         self._emit_request(request)
 
-    def _on_load_more_requested(self) -> None:
-        if not self._can_load_more():
-            # Short filtered lists can't scroll away from the bottom to reset the
-            # latch — re-enable so the next tick / scroll can retry.
-            self._results.reset_near_bottom_gate()
-            self._sync_load_more()
+    def _on_prev_page_requested(self) -> None:
+        self._results.go_prev_page()
+        self._sync_pager()
+
+    def _on_page_requested(self, page: int) -> None:
+        target = max(1, int(page))
+        loaded = self._results.loaded_page_count()
+        if target <= loaded:
+            self._results.go_to_page(target)
+            self._sync_pager()
+            return
+        # Provisional page beyond the buffer — fetch until that page exists.
+        if self._showing_labeled_library:
+            self._sync_pager()
+            return
+        if self._running or self._pending_append:
+            self._pending_target_page = target
+            self._advance_after_fetch = True
+            self._schedule_fetch_more(clear_page=True)
+            self._sync_pager()
+            return
+        if self._has_remote_more() or self._next_from or self._time_end_cursor or any(
+            self._query_cursors.values()
+        ):
+            if self._feed_exhausted:
+                self._feed_exhausted = False
+                self._results.set_feed_exhausted(False)
+            self._pending_target_page = target
+            self._advance_after_fetch = True
+            self._fetch_more_page(clear_page=True)
+            return
+        self._results.go_to_page(min(target, max(1, loaded)))
+        self._sync_pager()
+
+    def _on_page_size_changed(self, _size: int) -> None:
+        self._results.go_to_page(1)
+        self._sync_pager()
+        if not self._running:
+            QTimer.singleShot(0, self._maybe_autofill_min_views)
+
+    def _on_next_page_requested(self) -> None:
+        if self._results.can_go_next_local():
+            self._results.go_next_page()
+            self._sync_pager()
+            return
+        # Always try to fetch more when the user asks — even if we previously
+        # marked the feed exhausted (cursor may still exist / reopen).
+        if self._showing_labeled_library:
+            self._sync_pager()
+            return
+        loaded = self._results.loaded_page_count()
+        target = max(1, loaded) + 1
+        if self._running or self._pending_append:
+            # Remember the intent and fetch when the current job finishes.
+            self._pending_target_page = target
+            self._advance_after_fetch = True
+            self._schedule_fetch_more(clear_page=True)
+            self._sync_pager()
+            return
+        if self._has_remote_more() or self._next_from or self._time_end_cursor or any(
+            self._query_cursors.values()
+        ):
+            if self._feed_exhausted:
+                self._feed_exhausted = False
+                self._results.set_feed_exhausted(False)
+            self._pending_target_page = target
+            self._advance_after_fetch = True
+            self._fetch_more_page(clear_page=True)
+            return
+        self._sync_pager()
+
+    def _schedule_fetch_more(self, *, clear_page: bool = False) -> None:
+        """Fetch next VK page after the current worker has fully stopped."""
+
+        def _try() -> None:
+            if self._running or self._pending_append:
+                QTimer.singleShot(150, _try)
+                return
+            self._fetch_more_page(clear_page=clear_page)
+
+        QTimer.singleShot(150, _try)
+
+    def _fetch_more_page(self, *, clear_page: bool = False) -> None:
+        if self._running or self._pending_append:
+            # Worker still winding down — retry without dropping target page.
+            if self._pending_target_page is not None or self._advance_after_fetch:
+                self._schedule_fetch_more(clear_page=clear_page)
+                return
+            self._sync_pager()
+            return
+        if not self._can_fetch_more():
+            # Transient queue / soft-busy: keep the target and retry.
+            if (
+                (self._pending_target_page is not None or self._advance_after_fetch)
+                and (
+                    self._query_step_queue
+                    or self._has_remote_more()
+                    or self._next_from
+                    or self._time_end_cursor
+                )
+            ):
+                self._schedule_fetch_more(clear_page=clear_page)
+                return
+            self._advance_after_fetch = False
+            self._pending_target_page = None
+            self._sync_pager()
+            return
+        if self._session_queries:
+            self._query_step_queue = [
+                q for q in self._session_queries if self._query_cursors.get(q)
+            ]
+            if not self._query_step_queue:
+                self._feed_exhausted = True
+                self._results.set_feed_exhausted(True)
+                self._advance_after_fetch = False
+                self._pending_target_page = None
+                self._sync_pager()
+                return
+            self._start_next_query_step(append=True, clear_page=clear_page)
             return
         try:
             self._pending_append = True
             query = self._session_query
             if query is None:
                 query = self._query_input.text().strip() or None
-            min_views = self._results.current_min_views()
-            visible = len(self._results.visible_posts())
-            if min_views > 0 and visible < PAGE_SIZE:
-                limit = max(1, PAGE_SIZE - visible)
+            target = self._pending_target_page if clear_page else None
+            if self._has_narrowing_filter():
+                limit = self._matching_posts_needed(target_page=target)
             else:
-                limit = PAGE_SIZE
-            request = PipelineRequest(
-                limit=limit,
+                limit = self._page_limit()
+            start_from = self._next_from
+            end_time: int | None = None
+            # VK dropped next_from — continue the frozen window via end_time slide.
+            if not start_from and self._time_end_cursor is not None:
+                end_time = self._time_end_cursor
+            request = self.build_request(
                 query=query,
-                start_from=self._next_from,
-                exclude_texts=frozenset(self._seen_texts),
-                min_views=min_views,
+                start_from=start_from,
+                limit=limit,
+                append=True,
+                target_page=target,
+                end_time=end_time,
             )
         except ValueError as exc:
             self._pending_append = False
-            self._results.reset_near_bottom_gate()
-            self._sync_load_more()
+            self._advance_after_fetch = False
+            self._pending_target_page = None
+            self._sync_pager()
             QMessageBox.warning(self, "Некорректный ввод", str(exc))
             return
-        self._results.set_load_more_enabled(False)
-        if min_views > 0:
-            self._results.set_loading_more(
-                True,
-                hint=f"Ищем посты с ≥{min_views} просмотрами…",
-            )
-        else:
-            self._results.set_loading_more(True)
+        self._sync_pager()
+        self._results.set_loading_more(
+            True,
+            hint=self._filter_loading_hint() if request.needs_filtered_fill else None,
+            clear_page=clear_page,
+        )
         self._emit_request(request)
+
+    def _on_load_more_requested(self) -> None:
+        """Alias for tests / older call sites."""
+        self._fetch_more_page()

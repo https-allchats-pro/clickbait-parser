@@ -93,6 +93,8 @@ class FakeCatalog:
         page_size: int = 100,
         query: str | None = None,
         exclude_texts: frozenset[str] | set[str] | None = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
         on_progress=None,
     ) -> CollectResult:
         self.calls.append(
@@ -103,6 +105,8 @@ class FakeCatalog:
                 "page_size": page_size,
                 "query": query,
                 "exclude_texts": frozenset(exclude_texts or ()),
+                "start_time": start_time,
+                "end_time": end_time,
             }
         )
         if self.error is not None:
@@ -274,6 +278,15 @@ class ClickbaitPipelineTests(unittest.TestCase):
         analyzer.analyze.assert_called_once()
         self.assertTrue(result.posts[0].analysis.is_clickbait)
 
+    def test_time_window_passed_to_catalog(self) -> None:
+        catalog = FakeCatalog([_post(1)], next_from=None)
+        pipeline = ClickbaitPipeline(catalog_service=catalog, analyzer=FakeAnalyzer())
+        pipeline.run(
+            PipelineRequest(limit=1, start_time=1_700_000_000, end_time=1_700_086_400)
+        )
+        self.assertEqual(catalog.calls[0]["start_time"], 1_700_000_000)
+        self.assertEqual(catalog.calls[0]["end_time"], 1_700_086_400)
+
     def test_start_from_and_exclude_texts_passed(self) -> None:
         catalog = FakeCatalog([_post(1)], next_from="next-2")
         pipeline = ClickbaitPipeline(catalog_service=catalog, analyzer=FakeAnalyzer())
@@ -342,6 +355,35 @@ class ClickbaitPipelineTests(unittest.TestCase):
         self.assertEqual(result.collected, 2)
         self.assertIsNone(result.next_from)
 
+    def test_score_label_clickbait_keeps_scanning(self) -> None:
+        pages = [
+            [_post(1, text="a"), _post(2, text="b")],
+            [_post(3, text="c"), _post(4, text="d")],
+            [_post(5, text="e")],
+        ]
+        catalog = PagingFakeCatalog(pages)
+
+        class ScoreByIdAnalyzer:
+            def analyze(self, post: CatalogPost) -> ClickbaitAnalysis:
+                # Only post_ids 3 and 5 are clickbait under threshold 0.70.
+                score = 0.9 if post.post_id in {3, 5} else 0.1
+                return _analysis(post.id or 0, score=score)
+
+        pipeline = ClickbaitPipeline(
+            catalog_service=catalog,
+            analyzer=ScoreByIdAnalyzer(),
+            page_size=2,
+        )
+        with unittest.mock.patch.object(
+            ClickbaitPipeline, "_min_views_delay", return_value=0
+        ):
+            result = pipeline.run(
+                PipelineRequest(limit=2, score_label="clickbait", scoring_threshold=0.70)
+            )
+        self.assertEqual(len(result.posts), 2)
+        self.assertEqual([p.post.post_id for p in result.posts], [3, 5])
+        self.assertGreaterEqual(len(catalog.calls), 2)
+
 
 class PagingFakeCatalog:
     """Returns a different page per collect() call, advancing cursors."""
@@ -359,6 +401,8 @@ class PagingFakeCatalog:
         page_size: int = 100,
         query: str | None = None,
         exclude_texts: frozenset[str] | set[str] | None = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
         on_progress=None,
     ) -> CollectResult:
         index = 0
@@ -372,6 +416,8 @@ class PagingFakeCatalog:
                 "page_size": page_size,
                 "query": query,
                 "exclude_texts": frozenset(exclude_texts or ()),
+                "start_time": start_time,
+                "end_time": end_time,
             }
         )
         if index >= len(self.pages):

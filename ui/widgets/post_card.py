@@ -47,6 +47,7 @@ class PostCard(QFrame):
 
         self._post_text = ""
         self._link_urls: list[str] = []
+        self._post_url: str | None = None
         self._local_post_id: int | None = None
         self._human_label: DatasetLabel | None = None
         self._analyzed: AnalyzedPost | None = None
@@ -69,6 +70,12 @@ class PostCard(QFrame):
         self._copy_button.setText("Copy")
         self._copy_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self._copy_button.clicked.connect(self._on_copy)
+
+        self._open_post_button = QPushButton("Открыть пост")
+        self._open_post_button.setObjectName("linkButton")
+        self._open_post_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._open_post_button.setToolTip("Открыть пост во VK")
+        self._open_post_button.clicked.connect(self._on_open_post)
 
         self._btn_clickbait = QPushButton("👍 Кликбейт")
         self._btn_clickbait.setObjectName("labelGood")
@@ -102,6 +109,7 @@ class PostCard(QFrame):
         header.setSpacing(SP_8)
         header.addWidget(self._prediction, alignment=Qt.AlignmentFlag.AlignLeft)
         header.addWidget(self._copy_button, alignment=Qt.AlignmentFlag.AlignVCenter)
+        header.addWidget(self._open_post_button, alignment=Qt.AlignmentFlag.AlignVCenter)
         header.addStretch(1)
         header.addWidget(self._score)
 
@@ -234,6 +242,16 @@ class PostCard(QFrame):
         self._meta_label.setToolTip(
             f"Owner ID: {post.owner_id}\nPost ID: {post.post_id}\nViews: {post.views}"
         )
+
+        self._post_url = post.wall_url()
+        if self._post_url:
+            self._open_post_button.setEnabled(True)
+            self._open_post_button.setToolTip(self._post_url)
+            self._open_post_button.show()
+        else:
+            self._open_post_button.setEnabled(False)
+            self._open_post_button.setToolTip("")
+            self._open_post_button.hide()
 
         self._link_urls = [link.url for link in post.links if link.url]
         count = len(self._link_urls)
@@ -368,6 +386,11 @@ class PostCard(QFrame):
     def _on_copy(self) -> None:
         QGuiApplication.clipboard().setText(self._post_text)
         self._copy_button.setToolTip("Copied")
+
+    def _on_open_post(self) -> None:
+        if not self._post_url:
+            return
+        QDesktopServices.openUrl(QUrl(self._post_url))
 
     def _on_links_clicked(self) -> None:
         if not self._link_urls:

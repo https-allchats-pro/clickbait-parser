@@ -194,7 +194,7 @@ QFrame#cardDivider {{
     max-height: 1px;
 }}
 
-QLineEdit, QSpinBox, QComboBox, QListWidget {{
+QLineEdit, QSpinBox, QDateEdit, QComboBox, QListWidget {{
     background-color: {colors["bg_input"]};
     border: 1px solid {colors["border"]};
     border-radius: 8px;
@@ -202,7 +202,7 @@ QLineEdit, QSpinBox, QComboBox, QListWidget {{
     selection-background-color: {colors["accent"]};
 }}
 
-QLineEdit:focus, QSpinBox:focus, QComboBox:focus {{
+QLineEdit:focus, QSpinBox:focus, QDateEdit:focus, QComboBox:focus {{
     border: 1px solid {colors["accent"]};
 }}
 
@@ -441,6 +441,21 @@ QLabel#reasonChip {{
     border-radius: 10px;
     padding: 4px 10px;
     font-size: 11px;
+}}
+
+QPushButton#searchChip {{
+    background-color: {colors["chip_bg"]};
+    color: {colors["text"]};
+    border: 1px solid {colors["border"]};
+    border-radius: 12px;
+    padding: 4px 10px;
+    font-size: 12px;
+    font-weight: 500;
+}}
+
+QPushButton#searchChip:hover {{
+    background-color: {colors["button_hover"]};
+    border-color: {colors["accent"]};
 }}
 
 QLabel#reasonsTitle {{

@@ -28,6 +28,8 @@ class CatalogClient(Protocol):
         count: int = 100,
         start_from: str | None = None,
         query: str | None = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
     ) -> CatalogPage: ...
 
 
@@ -57,6 +59,8 @@ class VKCatalogClient:
         count: int = 100,
         start_from: str | None = None,
         query: str | None = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
     ) -> CatalogPage:
         try:
             page = get_newsfeed_search(
@@ -64,6 +68,8 @@ class VKCatalogClient:
                 count=count,
                 start_from=start_from,
                 q=query,
+                start_time=start_time,
+                end_time=end_time,
             )
         except VkNativeApiError as exc:
             if exc.error_code in {5, 1117}:

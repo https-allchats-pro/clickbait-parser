@@ -14,7 +14,8 @@ from domain.pipeline import (
     PipelineResult,
     PipelineState,
 )
-from domain.posts import CollectResult, post_text_key
+from domain.posts import CollectResult
+from domain.scoring import ScoringConfig, ScoringMode, compute_post_scoring
 
 
 class CatalogCollector(Protocol):
@@ -27,6 +28,8 @@ class CatalogCollector(Protocol):
         page_size: int = 100,
         query: str | None = None,
         exclude_texts: frozenset[str] | set[str] | None = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
         on_progress=None,
     ) -> CollectResult: ...
 
@@ -93,8 +96,8 @@ class ClickbaitPipeline:
             self._on_progress = on_progress
 
         try:
-            if request.min_views > 0:
-                return self._run_until_min_views(request, query=query)
+            if request.needs_filtered_fill:
+                return self._run_until_filters(request, query=query)
             return self._run_once(request, query=query)
         except Exception:
             self._state = PipelineState.FAILED
@@ -128,6 +131,8 @@ class ClickbaitPipeline:
             page_size=self._page_size,
             query=query,
             exclude_texts=request.exclude_texts,
+            start_time=request.start_time,
+            end_time=request.end_time,
             on_progress=_collect_progress,
         )
         posts = list(collect_result.posts)[: request.limit]
@@ -145,33 +150,36 @@ class ClickbaitPipeline:
             next_from=collect_result.next_from,
         )
 
-    def _run_until_min_views(
+    def _run_until_filters(
         self,
         request: PipelineRequest,
         *,
         query: str | None,
     ) -> PipelineResult:
-        """Keep collecting on the worker until ``limit`` posts meet ``min_views``.
+        """Keep collecting until ``limit`` posts match min_views / score_label.
 
         No batch cap: scans until the quota is filled or the VK cursor is gone.
         Empty / low-yield rounds use an increasing delay so rate limits and
         stagnant cursors can recover.
         """
-        min_views = int(request.min_views)
         matched: list[AnalyzedPost] = []
         scanned = 0
-        exclude: set[str] = set(request.exclude_texts)
         cursor = request.start_from
         next_from = cursor
-        batch_size = max(request.limit, self._page_size, _VK_CATALOG_PAGE_HINT)
+        # Keep batches near one UI page. A huge page_size (100+) with a large
+        # pages budget burns VK's ~1000-result window and returns next_from=None
+        # — pagination then collapses to a single page (esp. week/month windows).
+        batch_size = max(request.limit, _VK_CATALOG_PAGE_HINT)
+        pages_budget = min(12, self._pages_for_limit(batch_size))
         empty_rounds = 0
         batch_index = 0
+        seen_ids: set[tuple[str, int, int]] = set()
 
         self._set_state(PipelineState.COLLECTING, current=0, total=request.limit)
 
         while len(matched) < request.limit:
             if batch_index > 0:
-                time.sleep(self._min_views_delay(batch_index, empty_rounds=empty_rounds))
+                time.sleep(self._filter_fill_delay(batch_index, empty_rounds=empty_rounds))
             batch_index += 1
 
             def _collect_progress(current: int, total: int) -> None:
@@ -187,10 +195,11 @@ class ClickbaitPipeline:
             collect_result = self._catalog.collect(
                 count=batch_size,
                 start_from=cursor,
-                pages=self._pages_for_limit(batch_size),
+                pages=pages_budget,
                 page_size=self._page_size,
                 query=query,
-                exclude_texts=frozenset(exclude),
+                start_time=request.start_time,
+                end_time=request.end_time,
                 on_progress=_collect_progress,
             )
             batch = list(collect_result.posts)
@@ -204,11 +213,6 @@ class ClickbaitPipeline:
                 continue
 
             before_matched = len(matched)
-            for post in batch:
-                key = post_text_key(post.text)
-                if key:
-                    exclude.add(key)
-
             scanned += len(batch)
             analyzed_batch = self._analyze_posts(
                 batch,
@@ -216,7 +220,12 @@ class ClickbaitPipeline:
                 matched_so_far=len(matched),
             )
             for item in analyzed_batch:
-                if int(item.post.views or 0) < min_views:
+                post = item.post
+                key = (post.source, int(post.owner_id), int(post.post_id))
+                if key in seen_ids:
+                    continue
+                seen_ids.add(key)
+                if not self._matches_request_filters(item, request):
                     continue
                 matched.append(item)
                 if len(matched) >= request.limit:
@@ -247,13 +256,45 @@ class ClickbaitPipeline:
             next_from=next_from,
         )
 
+    # Keep old name as alias so existing tests / patches keep working.
+    _run_until_min_views = _run_until_filters
+
     @staticmethod
-    def _min_views_delay(batch_index: int, *, empty_rounds: int) -> float:
-        """Backoff between catalog scans; grows faster after empty rounds."""
+    def _matches_request_filters(item: AnalyzedPost, request: PipelineRequest) -> bool:
+        if request.min_views > 0 and int(item.post.views or 0) < request.min_views:
+            return False
+        if request.score_label is None:
+            return True
+        try:
+            mode = ScoringMode(request.scoring_mode)
+        except ValueError:
+            mode = ScoringMode.RULES
+        scoring = compute_post_scoring(
+            rules_score=item.rules_score,
+            ml_score=item.ml_score,
+            mode=mode,
+            config=ScoringConfig(
+                rules_weight=request.scoring_rules_weight,
+                ml_weight=request.scoring_ml_weight,
+                threshold=request.scoring_threshold,
+            ),
+        )
+        if request.score_label == "clickbait":
+            return bool(scoring.is_clickbait)
+        if request.score_label == "normal":
+            return not bool(scoring.is_clickbait)
+        return True
+
+    @staticmethod
+    def _filter_fill_delay(batch_index: int, *, empty_rounds: int) -> float:
+        """Backoff between filtered catalog scans; grows after empty rounds."""
         base = _MIN_VIEWS_DELAY_START * (1.0 + 0.12 * max(0, batch_index - 1))
         empty_boost = 0.35 * max(0, empty_rounds)
         delay = min(_MIN_VIEWS_DELAY_MAX, base + empty_boost)
         return delay + random.uniform(0.0, 0.12)
+
+    # Backwards-compatible name for tests that patch the delay helper.
+    _min_views_delay = _filter_fill_delay
 
     def _analyze_posts(
         self,
@@ -301,6 +342,7 @@ class ClickbaitPipeline:
         *,
         collected: int,
         next_from: str | None,
+        query_cursors: dict[str, str | None] | None = None,
     ) -> PipelineResult:
         self._set_state(
             PipelineState.COMPLETED,
@@ -312,15 +354,18 @@ class ClickbaitPipeline:
             collected=collected,
             analyzed=len(analyzed_posts),
             next_from=next_from,
+            query_cursors=dict(query_cursors or {}),
         )
 
     def _pages_for_limit(self, limit: int) -> int:
         # Extra page budget: VK pages often overlap; collect() also stops on stagnant pages.
+        # Deep pagination with a large exclude set needs many more VK pages per UI page.
         return max(
             1,
-            limit,
+            limit * 3,
             (limit + self._page_size - 1) // self._page_size,
             (limit + _VK_CATALOG_PAGE_HINT - 1) // _VK_CATALOG_PAGE_HINT,
+            30,
         )
 
     def _set_state(self, state: PipelineState, *, current: int, total: int) -> None:

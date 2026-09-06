@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 # Headless Qt for CI / local pytest — must be set before Qt imports.
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -18,7 +18,7 @@ from domain.pipeline import (
     PipelineResult,
     PipelineState,
 )
-from domain.posts import CatalogPost, SOURCE_VK_CATALOG, post_text_key
+from domain.posts import CatalogPost, SOURCE_VK_CATALOG
 from ui.formatters import (
     format_post_date,
     format_reason,
@@ -29,7 +29,7 @@ from ui.formatters import (
 from ui.main_window import MainWindow
 from ui.profile_dialog import ProfileSelectDialog, format_profile_label
 from ui.widgets.post_card import PostCard
-from ui.widgets.results_view import ResultFilter, ResultSort, ResultsView
+from ui.widgets.results_view import ResultFilter, ResultSort, ResultsView, TimePreset
 from app.auth.models import VKProfile
 from ui.theme import apply_theme
 
@@ -58,13 +58,19 @@ class ThemeTests(unittest.TestCase):
         self.assertIn("#1d1d1f", sheet)
 
 
-def _post(local_id: int, text: str | None = None, *, views: int = 0) -> CatalogPost:
+def _post(
+    local_id: int,
+    text: str | None = None,
+    *,
+    views: int = 0,
+    at: datetime | None = None,
+) -> CatalogPost:
     return CatalogPost(
         source=SOURCE_VK_CATALOG,
         owner_id=-1,
         post_id=local_id,
         text=text if text is not None else f"text-{local_id}",
-        date=datetime.fromtimestamp(1_700_000_000, tz=UTC),
+        date=at or datetime.fromtimestamp(1_700_000_000, tz=UTC),
         views=views,
         id=local_id,
     )
@@ -76,9 +82,10 @@ def _analyzed(
     score: float,
     text: str | None = None,
     views: int = 0,
+    at: datetime | None = None,
 ) -> AnalyzedPost:
     return AnalyzedPost(
-        post=_post(local_id, text=text, views=views),
+        post=_post(local_id, text=text, views=views, at=at),
         analysis=ClickbaitAnalysis(
             post_id=local_id,
             score=score,
@@ -162,14 +169,46 @@ class MainWindowTests(unittest.TestCase):
     def test_build_request_from_inputs(self) -> None:
         window = MainWindow()
         window._query_input.setText("  новости  ")
-        request = window.build_request()
+        request = window.build_request(query=window._query_input.text().strip() or None)
         self.assertEqual(request.limit, 20)
         self.assertEqual(request.query, "новости")
 
     def test_empty_query_becomes_none(self) -> None:
         window = MainWindow()
         window._query_input.setText("   ")
-        self.assertIsNone(window.build_request().query)
+        self.assertIsNone(window.build_request(query=None).query)
+
+    def test_enter_adds_search_terms(self) -> None:
+        window = MainWindow()
+        window._query_input.setText("продолжение")
+        window._search._on_return_pressed()
+        window._query_input.setText("новости")
+        window._search._on_return_pressed()
+        self.assertEqual(window._search.terms(), ["продолжение", "новости"])
+
+    def test_multi_query_analyse_chains_async_steps(self) -> None:
+        window = MainWindow()
+        requests: list[PipelineRequest] = []
+        window.run_requested.connect(requests.append)
+        window._search.set_terms(["alpha", "beta"])
+        window._on_run_clicked()
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].query, "alpha")
+        self.assertEqual(window._query_step_queue, ["beta"])
+        # First word finishes → next word is queued asynchronously.
+        window.show_result(
+            PipelineResult(
+                posts=[_analyzed(1, score=0.9)],
+                collected=1,
+                analyzed=1,
+                next_from="c-a",
+            )
+        )
+        window.set_running(False)
+        _APP.processEvents()
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[1].query, "beta")
+        self.assertTrue(window._pending_append)
 
     def test_set_running_toggles_button(self) -> None:
         window = MainWindow()
@@ -228,17 +267,15 @@ class MainWindowTests(unittest.TestCase):
                 next_from="cursor-2",
             )
         )
-        # Short page fits the viewport → infinite scroll may already have requested.
-        if not requests:
-            self.assertTrue(window.next_page_enabled)
-            window._on_load_more_requested()
+        self.assertTrue(window.next_page_enabled)
+        window._on_next_page_requested()
         self.assertEqual(len(requests), 1)
         self.assertEqual(requests[0].start_from, "cursor-2")
         self.assertEqual(requests[0].limit, 20)
         self.assertTrue(window._pending_append)
-        self.assertFalse(window.next_page_enabled)
-        self.assertIn(post_text_key("text-1"), requests[0].exclude_texts)
-        self.assertIn(post_text_key("text-2"), requests[0].exclude_texts)
+        self.assertTrue(window._advance_after_fetch)
+        self.assertFalse(window._can_fetch_more())
+        self.assertEqual(requests[0].exclude_texts, frozenset())
 
         window.show_result(
             PipelineResult(
@@ -265,10 +302,11 @@ class MainWindowTests(unittest.TestCase):
         window.results_view.set_filter(ResultFilter.CLICKBAIT)
         self.assertEqual(window.results_view.current_filter(), ResultFilter.CLICKBAIT)
 
-        if not requests:
-            window._on_load_more_requested()
-        # Finish the in-flight page (ignore auto-chained requests after append).
+        window._fetch_more_page()
         first = requests[0]
+        self.assertEqual(first.score_label, "clickbait")
+        # Fill remaining slots on the first clickbait page (1 already loaded).
+        self.assertEqual(first.limit, 19)
         window.show_result(
             PipelineResult(
                 posts=[_analyzed(3, score=0.95), _analyzed(4, score=0.05)],
@@ -277,7 +315,6 @@ class MainWindowTests(unittest.TestCase):
                 next_from=None,
             )
         )
-        self.assertEqual(first.limit, 20)
         self.assertEqual(window.results_view.current_filter(), ResultFilter.CLICKBAIT)
         visible = window.results_view.visible_posts()
         self.assertEqual(len(visible), 2)
@@ -293,8 +330,11 @@ class MainWindowTests(unittest.TestCase):
                 next_from=None,
             )
         )
-        self.assertFalse(window.next_page_enabled)
+        self.assertFalse(window._can_fetch_more())
         self.assertTrue(window._feed_exhausted)
+        # Local next page is still available from the buffered posts.
+        self.assertTrue(window.results_view.can_go_next_local())
+        self.assertEqual(window.results_view.page_count(), 2)
 
     def test_empty_append_without_cursor_exhausts_feed(self) -> None:
         window = MainWindow()
@@ -350,8 +390,7 @@ class MainWindowTests(unittest.TestCase):
             )
         )
         window._query_input.setText("другой запрос")
-        if not requests:
-            window._on_load_more_requested()
+        window._fetch_more_page()
         self.assertEqual(requests[0].query, "новости")
         self.assertEqual(requests[0].start_from, "cursor-keep")
 
@@ -440,13 +479,15 @@ class MainWindowTests(unittest.TestCase):
         requests.clear()
         window.results_view.set_min_views(1_000)
         _APP.processEvents()
-        # Already have >= PAGE_SIZE visible — no fill-up autofill.
+        # Already have >= page size in the filtered buffer — no fill-up autofill.
         fill_ups = [r for r in requests if r.limit < 20]
         self.assertEqual(fill_ups, [])
-        self.assertGreaterEqual(len(window.results_view.visible_posts()), 20)
+        self.assertGreaterEqual(len(window.results_view.filtered_posts()), 20)
+        self.assertEqual(len(window.results_view.visible_posts()), 20)
 
+    def test_pager_next_fetches_when_past_buffer(self) -> None:
         window = MainWindow()
-        requests = []
+        requests: list[PipelineRequest] = []
         window.run_requested.connect(requests.append)
         window.show_result(
             PipelineResult(
@@ -459,35 +500,213 @@ class MainWindowTests(unittest.TestCase):
         window._pending_append = False
         window.results_view.set_loading_more(False)
         requests.clear()
-        window.results_view.reset_near_bottom_gate()
-        window.results_view.set_load_more_enabled(True)
-        window.results_view._check_near_bottom()
+
+        window._on_next_page_requested()
         self.assertEqual(len(requests), 1)
         self.assertEqual(requests[0].limit, 20)
+        self.assertTrue(window._advance_after_fetch)
+        self.assertEqual(window._pending_target_page, 2)
         self.assertTrue(window.results_view._loading_more)
-        self.assertFalse(window.results_view._loading_footer.isHidden())
-        # Guard against repeat until next page finishes.
-        window.results_view._check_near_bottom()
-        self.assertEqual(len(requests), 1)
 
-    def test_short_clickbait_list_reloads_at_bottom(self) -> None:
-        """Filtered short lists stay at bottom — pagination must not latch forever."""
+        window.show_result(
+            PipelineResult(
+                posts=[_analyzed(i, score=0.1) for i in range(2, 22)],
+                collected=20,
+                analyzed=20,
+                next_from="cursor-2",
+            ),
+            append=True,
+            target_page=2,
+        )
+        self.assertEqual(len(window.results_view.posts), 21)
+        self.assertEqual(window.results_view.loaded_page_count(), 2)
+        self.assertEqual(window.results_view.current_page(), 2)
+        self.assertEqual(len(window.results_view.visible_posts()), 1)
+        self.assertEqual(window.results_view.visible_posts()[0].post.id, 21)
+
+    def test_clickbait_filter_keeps_fetching_until_next_page(self) -> None:
+        """Clickbait tab asks the worker for score_label fill so Next gets matches."""
         window = MainWindow()
         requests: list[PipelineRequest] = []
         window.run_requested.connect(requests.append)
-        posts = [_analyzed(i, score=0.9, views=2_000) for i in range(1, 4)]
+        # 20 clickbait = exactly one filtered page.
+        clickbait = [_analyzed(i, score=0.9) for i in range(1, 21)]
         window.show_result(
-            PipelineResult(posts=posts, collected=3, analyzed=3, next_from="c-next")
+            PipelineResult(
+                posts=clickbait,
+                collected=20,
+                analyzed=20,
+                next_from="c1",
+            )
         )
         window.results_view.set_filter(ResultFilter.CLICKBAIT)
-        window.results_view.set_min_views(1_000)
         window._pending_append = False
-        window.results_view.set_loading_more(False)
+        window._empty_page_retries = 0
         requests.clear()
-        window._sync_load_more()
+
+        window._on_next_page_requested()
+        self.assertEqual(window._pending_target_page, 2)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].score_label, "clickbait")
+        self.assertEqual(requests[0].target_page, 2)
+        self.assertEqual(requests[0].limit, 20)
+        self.assertTrue(requests[0].needs_filtered_fill)
+
+        # Worker returns only matching clickbait (filtered fill).
+        window._pending_append = False
+        window.show_result(
+            PipelineResult(
+                posts=[_analyzed(i, score=0.95) for i in range(200, 220)],
+                collected=200,
+                analyzed=20,
+                next_from="c3",
+            ),
+            append=True,
+            target_page=2,
+        )
+        self.assertEqual(window.results_view.loaded_page_count(), 2)
+        self.assertEqual(window.results_view.current_page(), 2)
+        self.assertFalse(window._advance_after_fetch)
+
+    def test_clickbait_filter_autofills_short_first_page(self) -> None:
+        window = MainWindow()
+        requests: list[PipelineRequest] = []
+        window.run_requested.connect(requests.append)
+        window.show_result(
+            PipelineResult(
+                posts=[_analyzed(i, score=0.9) for i in range(1, 6)],
+                collected=5,
+                analyzed=5,
+                next_from="c1",
+            )
+        )
+        window._pending_append = False
+        requests.clear()
+        window.results_view._on_filter_clicked(1)
         _APP.processEvents()
-        self.assertGreaterEqual(len(requests), 1)
-        self.assertEqual(requests[0].start_from, "c-next")
+        self.assertEqual(window.results_view.current_filter(), ResultFilter.CLICKBAIT)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].score_label, "clickbait")
+        self.assertEqual(requests[0].limit, 15)
+
+    def test_pager_page_button_fetches_beyond_buffer(self) -> None:
+        """Clicking page 3 while on page 1 must fetch, not only step to page 2."""
+        window = MainWindow()
+        requests: list[PipelineRequest] = []
+        window.run_requested.connect(requests.append)
+        window.show_result(
+            PipelineResult(
+                posts=[_analyzed(i, score=0.9) for i in range(1, 41)],
+                collected=40,
+                analyzed=40,
+                next_from="c1",
+            )
+        )
+        window.results_view.set_filter(ResultFilter.CLICKBAIT)
+        window._pending_append = False
+        self.assertEqual(window.results_view.current_page(), 1)
+        self.assertEqual(window.results_view.loaded_page_count(), 2)
+        requests.clear()
+
+        window._on_page_requested(3)
+        self.assertEqual(window._pending_target_page, 3)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].target_page, 3)
+        self.assertEqual(requests[0].limit, 20)
+
+        window._pending_append = False
+        window.show_result(
+            PipelineResult(
+                posts=[_analyzed(i, score=0.95) for i in range(200, 220)],
+                collected=20,
+                analyzed=20,
+                next_from="c2",
+            ),
+            append=True,
+            target_page=3,
+        )
+        self.assertEqual(window.results_view.loaded_page_count(), 3)
+        self.assertEqual(window.results_view.current_page(), 3)
+
+    def test_show_result_keeps_append_when_flag_false_but_pending(self) -> None:
+        """Controller race used to pass append=False and wipe the feed."""
+        window = MainWindow()
+        window.show_result(
+            PipelineResult(
+                posts=[_analyzed(i, score=0.1) for i in range(1, 21)],
+                collected=20,
+                analyzed=20,
+                next_from="c1",
+            )
+        )
+        window._pending_append = True
+        window._advance_after_fetch = True
+        window._pending_target_page = 2
+        window.show_result(
+            PipelineResult(
+                posts=[_analyzed(i, score=0.1) for i in range(21, 41)],
+                collected=20,
+                analyzed=20,
+                next_from="c2",
+            ),
+            append=False,  # bogus flag from race
+            target_page=2,
+        )
+        self.assertEqual(len(window.results_view.posts), 40)
+        self.assertEqual(window.results_view.current_page(), 2)
+
+    def test_pager_prev_stays_in_buffer(self) -> None:
+        window = MainWindow()
+        requests: list[PipelineRequest] = []
+        window.run_requested.connect(requests.append)
+        window.show_result(
+            PipelineResult(
+                posts=[_analyzed(i, score=0.1) for i in range(1, 45)],
+                collected=44,
+                analyzed=44,
+                next_from="c-next",
+            )
+        )
+        requests.clear()
+        self.assertEqual(window.results_view.loaded_page_count(), 3)
+        self.assertEqual(window.results_view.page_count(), 4)  # + provisional next
+        window._on_page_requested(2)
+        self.assertEqual(window.results_view.current_page(), 2)
+        self.assertEqual(len(window.results_view.visible_posts()), 20)
+        window._on_prev_page_requested()
+        self.assertEqual(window.results_view.current_page(), 1)
+        self.assertEqual(requests, [])
+
+    def test_pager_page_size_change_reslices(self) -> None:
+        window = MainWindow()
+        window.show_result(
+            PipelineResult(
+                posts=[_analyzed(i, score=0.1) for i in range(1, 16)],
+                collected=15,
+                analyzed=15,
+                next_from=None,
+            )
+        )
+        window.results_view.set_page_size(5, emit=True)
+        window._on_page_size_changed(5)
+        self.assertEqual(window.results_view.page_size(), 5)
+        self.assertEqual(window.results_view.page_count(), 3)
+        self.assertEqual(len(window.results_view.visible_posts()), 5)
+
+    def test_pager_next_stays_enabled_when_exhausted(self) -> None:
+        window = MainWindow()
+        window.show_result(
+            PipelineResult(
+                posts=[_analyzed(1, score=0.9)],
+                collected=1,
+                analyzed=1,
+                next_from=None,
+            )
+        )
+        self.assertFalse(window._can_fetch_more())
+        self.assertFalse(window.results_view.can_go_next_local())
+        # Forward stays clickable even when VK reported no cursor.
+        self.assertTrue(window.results_view._pager._next.isEnabled())
 
     def test_loading_more_footer_hides_after_result(self) -> None:
         window = MainWindow()
@@ -646,31 +865,20 @@ class ResultsViewTests(unittest.TestCase):
         view.set_filter(ResultFilter.ALL)
         self.assertEqual(len(view.visible_posts()), 3)
 
-    def test_append_results_is_incremental(self) -> None:
+    def test_append_results_extends_buffer(self) -> None:
         view = ResultsView()
-        view.resize(800, 600)
-        view.show()
-        view.set_results([_analyzed(1, score=0.9), _analyzed(2, score=0.1)])
-        first_cards = [
-            view._cards_layout.itemAt(i).widget()
-            for i in range(view._cards_layout.count())
-            if view._cards_layout.itemAt(i).widget() is not None
-            and isinstance(view._cards_layout.itemAt(i).widget(), PostCard)
-        ]
-        self.assertEqual(len(first_cards), 2)
-        first_ids = {id(card) for card in first_cards}
-
-        view.append_results([_analyzed(3, score=0.2), _analyzed(4, score=0.8)])
-        cards = [
-            view._cards_layout.itemAt(i).widget()
-            for i in range(view._cards_layout.count())
-            if view._cards_layout.itemAt(i).widget() is not None
-            and isinstance(view._cards_layout.itemAt(i).widget(), PostCard)
-        ]
-        self.assertEqual(len(cards), 4)
-        # Existing widgets must be reused (no full rebuild).
-        self.assertTrue(first_ids.issubset({id(card) for card in cards}))
-        self.assertEqual(len(view.posts), 4)
+        posts = [_analyzed(i, score=0.1) for i in range(1, 13)]
+        view.set_results(posts[:6])
+        view.append_results(posts[6:])
+        self.assertEqual(len(view.posts), 12)
+        view.set_page_size(5)
+        view.go_to_page(1)
+        self.assertEqual(view.page_size(), 5)
+        self.assertEqual(len(view.visible_posts()), 5)
+        self.assertEqual(view.page_count(), 3)
+        view.go_next_page()
+        self.assertEqual(view.current_page(), 2)
+        self.assertEqual(len(view.visible_posts()), 5)
 
     def test_scoring_mode_changes_filter(self) -> None:
         from domain.scoring import ScoringMode
@@ -738,6 +946,107 @@ class ResultsViewTests(unittest.TestCase):
             [3, 2],
         )
 
+    def test_time_window_presets(self) -> None:
+        from datetime import timedelta
+
+        view = ResultsView()
+        start, end = view.current_time_window()
+        self.assertLess(start, end)
+        self.assertAlmostEqual(end - start, 24 * 3600, delta=5)
+
+        view.set_time_preset(TimePreset.WEEK)
+        start, end = view.current_time_window()
+        self.assertAlmostEqual(end - start, 7 * 24 * 3600, delta=5)
+
+        view.set_time_preset(TimePreset.MONTH)
+        start, end = view.current_time_window()
+        self.assertAlmostEqual(end - start, 30 * 24 * 3600, delta=5)
+
+        view.set_custom_period(date(2026, 9, 1), date(2026, 9, 3))
+        start, end = view.current_time_window()
+        self.assertEqual(view.current_time_preset(), TimePreset.CUSTOM)
+        self.assertLess(start, end)
+        # Custom spans 1st 00:00 → 3rd 23:59:59 ≈ 3 days.
+        self.assertGreaterEqual(end - start, 2 * 24 * 3600)
+        self.assertLessEqual(end - start, 3 * 24 * 3600 + 5)
+
+    def test_build_request_includes_time_window(self) -> None:
+        window = MainWindow()
+        window.results_view.set_time_preset(TimePreset.WEEK)
+        request = window.build_request()
+        self.assertIsNotNone(request.start_time)
+        self.assertIsNotNone(request.end_time)
+        self.assertAlmostEqual(
+            int(request.end_time) - int(request.start_time),
+            7 * 24 * 3600,
+            delta=5,
+        )
+
+    def test_session_time_window_frozen_across_pages(self) -> None:
+        window = MainWindow()
+        window.results_view.set_time_preset(TimePreset.MONTH)
+        window._session_start_time = 1_700_000_000
+        window._session_end_time = 1_700_000_000 + 30 * 24 * 3600
+        first = window.build_request()
+        second = window.build_request(start_from="cursor-2", append=True)
+        self.assertEqual(first.start_time, second.start_time)
+        self.assertEqual(first.end_time, second.end_time)
+        self.assertEqual(first.start_time, 1_700_000_000)
+
+    def test_time_watermark_keeps_pagination_without_next_from(self) -> None:
+        """Wide VK windows often omit next_from — keep a provisional next page."""
+        window = MainWindow()
+        window.results_view.set_time_preset(TimePreset.MONTH)
+        window._session_start_time = 1_700_000_000
+        window._session_end_time = 1_700_000_000 + 30 * 24 * 3600
+        posts = [
+            _analyzed(
+                i,
+                score=0.1,
+                at=datetime.fromtimestamp(1_700_500_000 - i * 100, tz=UTC),
+            )
+            for i in range(1, 21)
+        ]
+        window.show_result(
+            PipelineResult(
+                posts=posts,
+                collected=20,
+                analyzed=20,
+                next_from=None,
+            )
+        )
+        self.assertIsNotNone(window._time_end_cursor)
+        self.assertTrue(window._has_remote_more())
+        self.assertGreaterEqual(window.results_view.page_count(), 2)
+        requests: list[PipelineRequest] = []
+        window.run_requested.connect(requests.append)
+        window._on_next_page_requested()
+        self.assertEqual(len(requests), 1)
+        self.assertIsNone(requests[0].start_from)
+        self.assertEqual(requests[0].end_time, window._time_end_cursor)
+
+    def test_period_change_while_running_queues_restart(self) -> None:
+        window = MainWindow()
+        window._running = True
+        window._analysis_posts = [_analyzed(1, score=0.1)]
+        window.results_view.set_time_preset(TimePreset.MONTH, emit=True)
+        self.assertTrue(window._pending_period_restart)
+
+    def test_sort_by_newest_first(self) -> None:
+        view = ResultsView()
+        view.set_results(
+            [
+                _analyzed(1, score=0.9, at=datetime(2026, 9, 1, tzinfo=UTC)),
+                _analyzed(2, score=0.1, at=datetime(2026, 9, 5, tzinfo=UTC)),
+                _analyzed(3, score=0.8, at=datetime(2026, 9, 3, tzinfo=UTC)),
+            ]
+        )
+        view.set_sort(ResultSort.DATE_DESC)
+        self.assertEqual(
+            [p.post.post_id for p in view.visible_posts()],
+            [2, 3, 1],
+        )
+
     def test_sort_by_clickbait_score(self) -> None:
         view = ResultsView()
         view.set_results(
@@ -758,7 +1067,8 @@ class ResultsViewTests(unittest.TestCase):
             [1, 3, 2],
         )
 
-    def test_dedupes_identical_texts(self) -> None:
+    def test_keeps_same_text_from_different_posts(self) -> None:
+        """Text twins are allowed; only exact VK identity is deduped."""
         view = ResultsView()
         view.set_results(
             [
@@ -767,10 +1077,13 @@ class ResultsViewTests(unittest.TestCase):
                 _analyzed(3, score=0.8, text="Другой текст"),
             ]
         )
-        self.assertEqual(len(view.posts), 2)
+        self.assertEqual(len(view.posts), 3)
+        # Same owner/post_id wins once even if text differs.
+        view.append_results([_analyzed(1, score=0.5, text="другая редакция")])
+        self.assertEqual(len(view.posts), 3)
         self.assertEqual(
             [p.post.post_id for p in view.posts],
-            [1, 3],
+            [1, 2, 3],
         )
 
 
@@ -797,6 +1110,8 @@ class PostCardTests(unittest.TestCase):
         self.assertEqual(card._ml_row._value_label.text(), "—")
         self.assertIn("82%", card._final_row._value_label.text())
         self.assertIn("просмотр", card._meta_label.text().lower())
+        self.assertEqual(card._post_url, "https://vk.com/wall-1_1")
+        self.assertTrue(card._open_post_button.isEnabled())
         card._on_copy()
         self.assertEqual(QApplication.clipboard().text(), "полный текст поста")
         self.assertEqual(card._copy_button.toolTip(), "Copied")

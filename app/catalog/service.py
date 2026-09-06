@@ -4,7 +4,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from typing import Protocol
 
-from domain.posts import CatalogPage, CatalogPost, CollectResult, UpsertResult, post_text_key
+from domain.posts import CatalogPage, CatalogPost, CollectResult, UpsertResult
 
 CollectProgressCallback = Callable[[int, int], None]
 
@@ -16,6 +16,8 @@ class CatalogClientProtocol(Protocol):
         count: int = 100,
         start_from: str | None = None,
         query: str | None = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
     ) -> CatalogPage: ...
 
 
@@ -37,6 +39,10 @@ class CatalogService:
 
     # newsfeed.search paginates well with up to 50–100 items per page.
     VK_PAGE_SIZE = 50
+    # Stop only after many duplicate-only pages while the cursor still moves.
+    # Early stop (~5) cuts the feed around 40–60 posts once exclude_texts is large.
+    STAGNANT_HARD_CAP = 40
+    MAX_PAGES_CAP = 200
 
     def __init__(
         self,
@@ -62,14 +68,18 @@ class CatalogService:
         page_size: int = 100,
         query: str | None = None,
         exclude_texts: frozenset[str] | set[str] | None = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
         on_progress: CollectProgressCallback | None = None,
     ) -> CollectResult:
-        """Fetch up to ``count`` posts with unique text across catalog pages.
+        """Fetch up to ``count`` posts across catalog pages.
 
         ``count`` sent to VK stays fixed for the whole run — changing it between
         pages breaks ``start_from`` cursors and yields duplicate-only pages.
-        Posts with the same normalized text are kept only once (first wins).
-        ``exclude_texts`` seeds already-seen normalized texts (e.g. previous UI page).
+        Exact VK posts (source/owner/post_id) are kept only once. Identical text
+        from different posts is allowed so deep pagination is not starved.
+
+        ``start_time`` / ``end_time`` are passed to ``newsfeed.search`` (unix).
 
         When ``persist_posts`` is False, posts stay in memory with ephemeral ids
         and are not written to SQLite.
@@ -77,11 +87,17 @@ class CatalogService:
         target = max(0, int(count))
         effective_page_size = self.VK_PAGE_SIZE
         # Allow extra pages: feeds often repeat items across cursors.
-        max_pages = max(
-            1,
-            int(pages),
-            (target + effective_page_size - 1) // effective_page_size,
-            target,  # worst case: 1 new unique post per page
+        # Always hard-cap: unbounded scans burn VK's ~1000-result window and
+        # leave the UI with next_from=None (pagination stuck on page 1).
+        max_pages = min(
+            self.MAX_PAGES_CAP,
+            max(
+                1,
+                int(pages),
+                (target + effective_page_size - 1) // effective_page_size,
+                min(target, 40),  # worst case: 1 new post per page, bounded
+                min(self.MAX_PAGES_CAP, target * 3 + 10),
+            ),
         )
         if query is not None:
             query = str(query).strip() or None
@@ -92,7 +108,10 @@ class CatalogService:
         pages_done = 0
         last_next: str | None = None
         seen: set[tuple[str, int, int]] = set()
-        seen_texts: set[str] = set(exclude_texts or ())
+        # Optional seed of already-known VK ids (source, owner_id, post_id).
+        # ``exclude_texts`` is accepted for API compatibility but ignored: text
+        # dedupe starved deep pagination (Clickbait page 3+).
+        _ = exclude_texts
         stagnant_pages = 0
 
         while len(fetched_posts) < target and pages_done < max_pages:
@@ -100,6 +119,8 @@ class CatalogService:
                 count=effective_page_size,
                 start_from=cursor,
                 query=query,
+                start_time=start_time,
+                end_time=end_time,
             )
             pages_done += 1
             last_next = page.next_from
@@ -121,11 +142,6 @@ class CatalogService:
                 if key in seen:
                     continue
                 seen.add(key)
-                text_key = post_text_key(post.text)
-                if text_key:
-                    if text_key in seen_texts:
-                        continue
-                    seen_texts.add(text_key)
 
                 if self._persist_posts and self._posts is not None:
                     loaded = self._posts.get(post.source, post.owner_id, post.post_id)
@@ -141,16 +157,21 @@ class CatalogService:
                 on_progress(len(fetched_posts), target)
 
             if not batch_posts:
-                last_next = None
-                break
+                # Mapper may return [] while VK still provides next_from — do not
+                # kill the cursor (that used to freeze the pager on page 1).
+                if not page.next_from or page.next_from == cursor:
+                    last_next = None
+                    break
+                stagnant_pages += 1
+                if stagnant_pages >= self.STAGNANT_HARD_CAP:
+                    break
+                cursor = page.next_from
+                continue
             if len(fetched_posts) >= target:
                 # Keep last_next so the UI can request the following page.
                 break
             if new_in_page == 0:
                 stagnant_pages += 1
-                # Be patient: newsfeed often repeats before the cursor moves on.
-                if stagnant_pages >= 5:
-                    break
             else:
                 stagnant_pages = 0
             if not page.next_from:
@@ -158,6 +179,10 @@ class CatalogService:
                 break
             if page.next_from == cursor:
                 last_next = None
+                break
+            # Cursor advances but yields only duplicates — keep scanning until
+            # the hard cap so deep pagination still fills the next UI page.
+            if stagnant_pages >= self.STAGNANT_HARD_CAP:
                 break
             cursor = page.next_from
 
