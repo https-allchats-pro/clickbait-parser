@@ -13,3 +13,5 @@ dataset/*.csv
 models/*
 !models/.gitkeep
 *.joblib
+# Keep released zips out of git; rebuild via scripts/build_release.py
+release/

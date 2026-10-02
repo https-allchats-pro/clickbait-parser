@@ -14,8 +14,10 @@ META_FILENAME = "clickbait_model.meta.json"
 
 
 def default_models_dir() -> Path:
-    """Project-local ``models/`` next to ``data/``."""
-    return Path(__file__).resolve().parents[2] / "models"
+    """Project-local ``models/`` (or bundled path when frozen)."""
+    from app.runtime_paths import default_models_dir as _default_models_dir
+
+    return _default_models_dir()
 
 
 class ModelStore:

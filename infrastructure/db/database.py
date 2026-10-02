@@ -80,12 +80,9 @@ ON post_labels(label);
 
 def default_db_path() -> Path:
     """Prefer project-local data/app.sqlite3; fall back to ~/.clickbait-parser."""
-    local = Path(__file__).resolve().parents[2] / "data" / "app.sqlite3"
-    if local.parent.is_dir():
-        return local
-    root = Path.home() / ".clickbait-parser"
-    root.mkdir(parents=True, exist_ok=True)
-    return root / "app.sqlite3"
+    from app.runtime_paths import default_db_path as _default_db_path
+
+    return _default_db_path()
 
 
 def connect(db_path: Path | str | None = None) -> sqlite3.Connection:

@@ -34,7 +34,9 @@ from infrastructure.db.repositories.profile_repository import ProfileRepository
 from infrastructure.vk.catalog_client import CatalogAuthError, CatalogError, VKCatalogClient
 from infrastructure.vk.client import VKClient
 
-DEFAULT_DATASET_CSV = Path(__file__).resolve().parent / "dataset" / "clickbait_dataset.csv"
+from app.runtime_paths import default_dataset_csv
+
+DEFAULT_DATASET_CSV = default_dataset_csv()
 
 
 def build_parser() -> argparse.ArgumentParser:
