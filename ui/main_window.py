@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
@@ -19,11 +19,13 @@ from domain.ml import ModelInfo
 from domain.pipeline import PipelineProgress, PipelineRequest, PipelineResult
 from domain.dataset import DatasetLabel
 from domain.scoring import DEFAULT_SCORING_CONFIG
+from ui import theme
 from ui.theme import SP_4, SP_8, SP_12, SP_16, SP_24, get_current_theme, toggle_theme
 from ui.widgets.ml_panel import MLModelPanel
 from ui.widgets.model_insights_view import ModelInsightsView
 from ui.widgets.results_view import ResultFilter, ResultsView
 from ui.widgets.search_terms import SearchTermsBar
+from ui.widgets.theme_icons import moon_icon, sun_icon
 
 # Default page size; UI spinbox can change it at runtime.
 DEFAULT_PAGE_SIZE = 20
@@ -136,7 +138,8 @@ class MainWindow(QMainWindow):
         self._theme_button = QPushButton()
         self._theme_button.setObjectName("iconButton")
         self._theme_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._theme_button.setFixedWidth(88)
+        self._theme_button.setFixedSize(32, 32)
+        self._theme_button.setIconSize(QSize(18, 18))
         self._theme_button.clicked.connect(self._on_theme_toggled)
         self._sync_theme_button()
         self._tabs.setCornerWidget(
@@ -203,11 +206,12 @@ class MainWindow(QMainWindow):
         return self._results._header_run_button
 
     def _sync_theme_button(self) -> None:
+        color = theme.COLORS["text"]
         if get_current_theme() == "light":
-            self._theme_button.setText("Тёмная")
+            self._theme_button.setIcon(moon_icon(color))
             self._theme_button.setToolTip("Переключить на тёмную тему")
         else:
-            self._theme_button.setText("Светлая")
+            self._theme_button.setIcon(sun_icon(color))
             self._theme_button.setToolTip("Переключить на светлую тему")
 
     def _on_theme_toggled(self) -> None:

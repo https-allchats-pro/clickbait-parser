@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import unittest
 from datetime import UTC, date, datetime
+from unittest import mock
 
 # Headless Qt for CI / local pytest — must be set before Qt imports.
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -56,6 +57,24 @@ class ThemeTests(unittest.TestCase):
         sheet = build_stylesheet(LIGHT_COLORS)
         self.assertIn("#f5f5f7", sheet)
         self.assertIn("#1d1d1f", sheet)
+
+    def test_theme_button_shows_icon_for_target_theme(self) -> None:
+        from ui.theme import apply_theme
+
+        apply_theme(_APP, "dark", persist=False)
+        window = MainWindow()
+        button = window._theme_button
+        self.assertEqual(button.text(), "")
+        self.assertFalse(button.icon().isNull())
+        self.assertEqual(button.toolTip(), "Переключить на светлую тему")
+        dark_icon_key = button.icon().cacheKey()
+
+        with mock.patch("ui.theme.save_theme"):
+            button.click()
+        self.assertEqual(button.toolTip(), "Переключить на тёмную тему")
+        self.assertNotEqual(button.icon().cacheKey(), dark_icon_key)
+        apply_theme(_APP, "dark", persist=False)
+        window.deleteLater()
 
 
 def _post(
