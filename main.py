@@ -536,6 +536,11 @@ def _run_gui(*, profile_id: int | None, threshold: float, page_size: int) -> int
         MLTrainController(window=window, train_factory=ml_factory)
     )
     window.show()
+
+    from app.gui.update_controller import maybe_start_update_check
+    from app.release_info import UPDATE_REPO_URL
+
+    maybe_start_update_check(window, repo_url=UPDATE_REPO_URL)
     return int(app.exec())
 
 

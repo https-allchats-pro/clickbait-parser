@@ -13,10 +13,11 @@ jobs:
   build-windows:
     runs-on: windows-latest
     permissions:
-      contents: write  # create GitHub Release and upload assets
+      contents: write  # vpk upload creates the GitHub Release
     env:
       QT_QPA_PLATFORM: offscreen
       PYTHONUTF8: "1"
+      REPO_URL: https://github.com/${{ github.repository }}
 
     steps:
       - uses: actions/checkout@v4
@@ -27,26 +28,74 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
 
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
       - name: Install dependencies
         run: |
           python -m pip install -U pip
           pip install -e ".[dev,build]"
+          # Keep in sync with the velopack version installed from PyPI.
+          dotnet tool install -g vpk --version 1.2.161
 
       - name: Test
         run: pytest -q
 
-      - name: Build
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $version = "${{ github.ref_name }}".TrimStart("v")
+          } else {
+            $version = "0.0.0-ci.${{ github.run_number }}"
+          }
+          if ($version -notmatch '^\d+\.\d+\.\d+([-+].+)?$') {
+            throw "Tag must be semver like v1.2.3, got '${{ github.ref_name }}'"
+          }
+          "value=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Embed update source
+        shell: pwsh
+        run: |
+          @"
+          from __future__ import annotations
+
+          UPDATE_REPO_URL: str | None = "$env:REPO_URL"
+          "@ | Set-Content -Encoding utf8 app/release_info.py
+
+      - name: Build (PyInstaller)
         run: python scripts/build_release.py --os windows --clean
+
+      - name: Fetch previous release (for delta updates)
+        if: github.ref_type == 'tag'
+        continue-on-error: true  # first release has nothing to fetch
+        run: vpk download github --repoUrl ${{ env.REPO_URL }} --token ${{ secrets.GITHUB_TOKEN }} -o Releases
+
+      - name: Pack (Velopack)
+        run: >
+          vpk pack
+          --packId ClickbaitParser
+          --packVersion ${{ steps.version.outputs.value }}
+          --packDir dist/ClickbaitParser
+          --mainExe ClickbaitParser.exe
+          --packTitle "Clickbait Parser"
+          -o Releases
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ClickbaitParser-windows-x64
-          path: dist/release/ClickbaitParser-windows-x64.zip
+          name: ClickbaitParser-windows-${{ steps.version.outputs.value }}
+          path: Releases/
           if-no-files-found: error
 
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/release/ClickbaitParser-windows-x64.zip
-          generate_release_notes: true
+        if: github.ref_type == 'tag'
+        run: >
+          vpk upload github
+          --repoUrl ${{ env.REPO_URL }}
+          --token ${{ secrets.GITHUB_TOKEN }}
+          --publish
+          --releaseName "${{ github.ref_name }}"
+          --tag ${{ github.ref_name }}
+          -o Releases

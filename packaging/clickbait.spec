@@ -28,6 +28,7 @@ hiddenimports: list[str] = [
     "allchats_sdk.providers.vk.native_api",
     "allchats_sdk.providers.vk.qr_auth",
     "allchats_sdk.credentials",
+    "velopack",
 ]
 
 for pkg in ("PyQt6", "sklearn", "allchats_sdk", "certifi"):
